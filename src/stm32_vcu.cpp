@@ -85,6 +85,7 @@
 #include "my_math.h"
 #include "notused.h"
 #include "oibms.h"
+#include "orionbms.h"
 #include "outlanderCharger.h"
 #include "outlanderinverter.h"
 #include "param_save.h"
@@ -199,6 +200,7 @@ static Chargerint *selectedChargeInt = &UnUsed;
 static Shifter *selectedShifter = &UnUsed;
 static SimpBMS BMSsimp;
 static OIBMS flyingAdcBms;
+static OrionBMS orionBms;
 static LeafBMS BMSleaf;
 static DaisychainBMS BMSdaisychain;
 static KangooBMS BMSRenaultKangoo33;
@@ -1143,7 +1145,12 @@ static void UpdateBMS() {
   case BMSModes::BMSOIFlyingAdc:
     selectedBMS = &flyingAdcBms;
     break;
-  default:
+
+  case BMSModes::BMSOrion:
+    selectedBMS = &orionBms;
+    break;
+
+default:
     // Default to no BMS
     selectedBMS = &UnUsed;
     break;
