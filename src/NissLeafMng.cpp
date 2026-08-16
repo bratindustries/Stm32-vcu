@@ -2,6 +2,7 @@
  * This file is part of the ZombieVerter project.
  *
  * Copyright (C) 2021-2023  Tom de Bree <Tom@voltinflux.com>
+ * Changes by Angus Johnson <info@bratindustries.net>
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -26,9 +27,88 @@ static uint8_t mprun100 = 0;
 static uint8_t OBCpwr = 0;
 static uint16_t SleepCount = 0;
 
+enum QuickChargeState {
+  QC_IDLE,
+  QC_START,
+  QC_ENABLE,
+  QC_ACTIVE,
+  QC_STOP
+};
+
+static QuickChargeState quickChargeState = QC_IDLE;
+static bool quickChargeRequested = false;
+static bool quickChargeReady = false;
+static uint8_t quickEnableTicks = 0;
+static uint8_t quickStopTicks = 0;
+
+static const uint8_t QUICK_ENABLE_TICKS = 80; // 80 x 10 ms = 800 ms
+static const uint8_t QUICK_STOP_TICKS = 100; // 100 x 10 ms = 1 second
+static const uint32_t PDM_DCFC_MAX_POWER_W = 50000;
+
 CanHardware *can;
 
 void NissLeafMng::SetCanInterface(CanHardware *c) { can = c; }
+
+void NissLeafMng::SetQuickChargeMode(bool enabled) {
+  if (enabled == quickChargeRequested)
+    return;
+
+  quickChargeRequested = enabled;
+
+  if (enabled) {
+    quickChargeState = QC_START;
+    quickEnableTicks = 0;
+    quickStopTicks = 0;
+  } else if (quickChargeState != QC_IDLE) {
+    quickChargeState = QC_STOP;
+    quickStopTicks = QUICK_STOP_TICKS;
+    quickChargeReady = false;
+  }
+}
+
+void NissLeafMng::SetQuickChargeReady(bool ready) {
+  quickChargeReady = ready;
+}
+
+static uint8_t Calculate1F2Checksum(uint8_t *bytes) {
+  uint8_t sum = 0;
+
+  for (uint8_t i = 0; i < 7; i++) {
+    sum += bytes[i] >> 4;
+    sum += bytes[i] & 0x0F;
+  }
+
+  // Byte 7 bit 7 is part of the message and is included in the checksum.
+  sum += bytes[7] >> 4;
+  return (sum + 2) & 0x0F;
+}
+
+static uint16_t GetQuickChargePowerRaw(bool requireStationReady) {
+  if (!quickChargeRequested ||
+      (requireStationReady && !quickChargeReady))
+    return 100; // 100 raw = 0 kW
+
+  int32_t batteryVoltage = Param::GetInt(Param::udc);
+  int32_t targetVoltage = Param::GetInt(Param::Voltspnt);
+  int32_t bmsCurrentLimit = Param::GetInt(Param::BMS_ChargeLim);
+  int32_t userCurrentLimit = Param::GetInt(Param::CCS_ILim);
+  int32_t stationCurrentLimit = Param::GetInt(Param::CCS_I_Avail);
+  int32_t stationVoltageLimit = Param::GetInt(Param::CCS_V_Avail);
+
+  if (batteryVoltage <= 0 || batteryVoltage >= targetVoltage ||
+      bmsCurrentLimit <= 0 || userCurrentLimit <= 0 ||
+      stationCurrentLimit <= 0 || stationVoltageLimit <= batteryVoltage)
+    return 100;
+
+  int32_t currentLimit = MIN(bmsCurrentLimit, userCurrentLimit);
+  currentLimit = MIN(currentLimit, stationCurrentLimit);
+
+  uint32_t powerWatts = (uint32_t)batteryVoltage * currentLimit;
+  if (powerWatts > PDM_DCFC_MAX_POWER_W)
+    powerWatts = PDM_DCFC_MAX_POWER_W;
+
+  return (powerWatts / 100) + 100;
+}
 
 void NissLeafMng::Task10Ms(int16_t final_torque_request) {
   uint8_t bytes[8];
@@ -36,6 +116,26 @@ void NissLeafMng::Task10Ms(int16_t final_torque_request) {
   int opmode = Param::GetInt(Param::opmode);
 
   int Dir = Param::GetInt(Param::dir);
+
+  if (quickChargeRequested) {
+    if (opmode != MOD_CHARGE) {
+      quickChargeState = QC_START;
+      quickEnableTicks = 0;
+    } else if (quickChargeState == QC_START) {
+      quickChargeState = QC_ENABLE;
+      quickEnableTicks = QUICK_ENABLE_TICKS;
+    } else if (quickChargeState == QC_ENABLE) {
+      if (quickEnableTicks > 0)
+        quickEnableTicks--;
+      else
+        quickChargeState = QC_ACTIVE;
+    }
+  } else if (quickChargeState == QC_STOP) {
+    if (quickStopTicks > 0)
+      quickStopTicks--;
+    else
+      quickChargeState = QC_IDLE;
+  }
 
   if (SendCan == true) // only send CAN when needed
   {
@@ -298,17 +398,66 @@ void NissLeafMng::Task10Ms(int16_t final_torque_request) {
       OBCpwr = 0x64;
     }
 
-    // Commanded chg power in byte 1 and byte 0 bits 0-1. 10 bit number.
-    // byte 1=0x64 and byte 0=0x00 at 0 power.
-    // 0x00 chg 0ff dcdc on.
-    bytes[0] = 0x30; // msg is muxed but pdm doesn't seem to care.
-    bytes[1] = OBCpwr;
-    bytes[2] = 0x20; // 0x20=Normal Charge
-    bytes[3] = 0xAC;
-    bytes[4] = 0x00;
-    bytes[5] = 0x3C;
-    bytes[6] = mprun10;
-    bytes[7] = 0x8F; // may not need checksum here?
+    if (quickChargeState == QC_START) {
+      // Observed ZE1 quick-charge start request. Keep requested power at zero
+      // until vehicle precharge has completed and MOD_CHARGE is active.
+      bytes[0] = 0x00;
+      bytes[1] = 0x64;
+      bytes[2] = 0x44;
+      bytes[3] = 0xA0;
+      bytes[4] = 0x00;
+      bytes[5] = 0x50;
+      bytes[6] = mprun10;
+      bytes[7] = 0x00;
+      bytes[7] |= Calculate1F2Checksum(bytes);
+    } else if (quickChargeState == QC_ENABLE) {
+      // OEM captures hold this relay-enable phase for about 800 ms before
+      // allowing the PDM to generate a non-zero CHAdeMO current request.
+      bytes[0] = 0x00;
+      bytes[1] = 0x64;
+      bytes[2] = 0xC4;
+      bytes[3] = 0xA0;
+      bytes[4] = 0x00;
+      bytes[5] = 0x52;
+      bytes[6] = mprun10;
+      bytes[7] = 0x00;
+      bytes[7] |= Calculate1F2Checksum(bytes);
+    } else if (quickChargeState == QC_ACTIVE) {
+      uint16_t quickPowerRaw = GetQuickChargePowerRaw(true);
+
+      // The PDM converts this maximum power request into the current request
+      // carried in its mirrored 0x3BC/CHAdeMO 0x102 message.
+      bytes[0] = (quickPowerRaw > 100 ? 0x50 : 0x10) |
+                 ((quickPowerRaw >> 8) & 0x03);
+      bytes[1] = quickPowerRaw & 0xFF;
+      bytes[2] = 0xC0;
+      bytes[3] = 0xA0;
+      bytes[4] = 0x00;
+      bytes[5] = quickPowerRaw > 100 ? 0x5A : 0x54;
+      bytes[6] = mprun10;
+      bytes[7] = 0x80;
+      bytes[7] |= Calculate1F2Checksum(bytes);
+    } else if (quickChargeState == QC_STOP) {
+      bytes[0] = 0x10;
+      bytes[1] = 0x64;
+      bytes[2] = 0xE0;
+      bytes[3] = 0xA0;
+      bytes[4] = 0x00;
+      bytes[5] = 0x54;
+      bytes[6] = mprun10;
+      bytes[7] = 0x80;
+      bytes[7] |= Calculate1F2Checksum(bytes);
+    } else {
+      // Existing normal AC-charge command remains unchanged.
+      bytes[0] = 0x30; // msg is muxed but pdm doesn't seem to care.
+      bytes[1] = OBCpwr;
+      bytes[2] = 0x20; // 0x20=Normal Charge
+      bytes[3] = 0xAC;
+      bytes[4] = 0x00;
+      bytes[5] = 0x3C;
+      bytes[6] = mprun10;
+      bytes[7] = 0x8F; // existing AC behavior
+    }
 
     can->Send(0x1F2, (uint32_t *)bytes, 8);
 
@@ -355,8 +504,14 @@ void NissLeafMng::Task10Ms(int16_t final_torque_request) {
       // limit in kw.
       bytes[0] = 0xA0; // 0x6E - 110kw limit 0xA0-160Kw limit
       bytes[1] = 0x0A;
-      bytes[2] = 0x05;
-      bytes[3] = 0xD5;
+      if (quickChargeState != QC_IDLE) {
+        uint16_t chargePowerLimit = GetQuickChargePowerRaw(false);
+        bytes[2] = (chargePowerLimit >> 6) & 0x0F;
+        bytes[3] = ((chargePowerLimit & 0x3F) << 2) | 0x01;
+      } else {
+        bytes[2] = 0x05;
+        bytes[3] = 0xD5;
+      }
       bytes[4] = 0x00; // may not need pairing code crap here...and we don't:)
       bytes[5] = 0x00;
       bytes[6] = mprun10;

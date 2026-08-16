@@ -89,6 +89,7 @@
 #include "outlanderinverter.h"
 #include "param_save.h"
 #include "params.h"
+#include "pdmChademo.h"
 #include "preheater.h"
 #include "printf.h"
 #include "rearoutlanderinverter.h"
@@ -173,6 +174,7 @@ static outlanderCharger outChg;
 static MGgen2V2Lcharger MGgen2v2l;
 static C5Charger c5Chg;
 static FCChademo chademoFC;
+static PdmChademoInterface pdmChademoFC;
 static i3LIMClass LIMFC;
 static CPCClass CPCcan;
 static FoccciClass Focccican;
@@ -480,6 +482,12 @@ static void Ms100Task(void) {
     chargeMode = false;   // no charge mode
     chargeModeDC = false; // DC charge mode off
   }
+
+  // PDM-mediated CHAdeMO uses the normal VCU DC charge-mode sequencing, but
+  // all CHAdeMO CAN control is performed by NissanPDM/NissLeafMng.
+  chargerPDM.SetDcfcMode(targetCharger == ChargeModes::Leaf_PDM &&
+                         targetChgint == ChargeInterfaces::PdmChademo &&
+                         chargeModeDC);
 
   if (!chargeModeDC) // Request to run ac charge from the interface (e.g. LIM)
                      // if we are NOT in DC charge mode.
@@ -1062,6 +1070,9 @@ static void UpdateChargeInt() {
     break;
   case ChargeInterfaces::Chademo:
     selectedChargeInt = &chademoFC;
+    break;
+  case ChargeInterfaces::PdmChademo:
+    selectedChargeInt = &pdmChademoFC;
     break;
   case ChargeInterfaces::i3LIM:
     selectedChargeInt = &LIMFC;

@@ -4,6 +4,7 @@
  * Copyright (C) 2011-2019 Johannes Huebner <dev@johanneshuebner.com>
  * Copyright (C) 2019-2022 Damien Maguire <info@evbmw.com>
  * Changes by Tom de Bree <tom@voltinflux.com> 2024
+ * Changes by Angus Johnson <info@bratindustries.net>
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -366,7 +367,8 @@
   "0=Off, 1=EXT_DIGI, 2=Volt_Ampera, 3=Leaf_PDM, 4=TeslaOI, 5=Out_lander, "    \
   "6=Elcon, 7=MGgen2, 8=C5_PTECAN"
 #define CHGCTRL "0=Enable, 1=Disable, 2=Timer"
-#define CHGINT "0=Unused, 1=i3LIM, 2=Chademo, 3=CPC, 4=Foccci"
+#define CHGINT                                                                \
+  "0=Unused, 1=i3LIM, 2=Chademo, 3=CPC, 4=Foccci, 5=pdm chademo"
 #define CAN3SPD "0=k33.3, 1=k500, 2=k100"
 #define TRNMODES "0=Manual, 1=Auto"
 #define CAT_AIRCON "Air Conditioning"
@@ -454,7 +456,8 @@ enum ChargeInterfaces {
   i3LIM = 1,
   Chademo = 2,
   CPC = 3,
-  Foccci = 4
+  Foccci = 4,
+  PdmChademo = 5
 };
 
 enum HeatType {

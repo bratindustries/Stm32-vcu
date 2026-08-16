@@ -36,6 +36,8 @@ public:
   static void Task100Ms();
   static void SetCanInterface(CanHardware *c);
   static void SetPullInEVSE(bool pullInEVSE);
+  static void SetQuickChargeMode(bool enabled);
+  static void SetQuickChargeReady(bool ready);
   static void nissan_crc(uint8_t *data, uint8_t polynomial);
 
 protected:
