@@ -3,6 +3,8 @@
  *
  * Copyright (C) 2020 Johannes Huebner <dev@johanneshuebner.com>
  *               2021-2022 Damien Maguire <info@evbmw.com>
+ * changes by Angus Johnson 2026 <info@bratindutries.net>
+ *
  * Yes I'm really writing software now........run.....run away.......
  *
  * This program is free software: you can redistribute it and/or modify
@@ -28,6 +30,14 @@
 #include "vehicle.h"
 
 namespace utils {
+enum MeasurementSource {
+  MEASUREMENT_LEAF_INVERTER = 0,
+  MEASUREMENT_ISA,
+  MEASUREMENT_BMW_SBOX,
+  MEASUREMENT_VAG_SBOX,
+  MEASUREMENT_SOURCE_COUNT
+};
+
 inline int32_t change(int32_t x, int32_t in_min, int32_t in_max,
                       int32_t out_min, int32_t out_max) {
   return (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min;
@@ -41,6 +51,18 @@ inline float changeFloat(float x, float in_min, float in_max, float out_min,
 float GetUserThrottleCommand(CanHardware *);
 float ProcessThrottle(int);
 float ProcessUdc(int);
+// Get returns the last published value even if it is stale. Available means
+// the configured source supports that measurement. Fresh additionally means
+// a valid source frame was received within the watchdog timeout.
+float GetIdc();
+bool IdcAvailable();
+bool IdcFresh();
+float GetUdc();
+bool UdcAvailable();
+bool UdcFresh();
+void IdcReceived(MeasurementSource source);
+void UdcReceived(MeasurementSource source);
+void MeasurementWatchdogTask100Ms();
 void CalcSOC();
 void GetDigInputs(CanHardware *);
 void PostErrorIfRunning(ERROR_MESSAGE_NUM);

@@ -374,6 +374,7 @@ static void Ms200Task(void) {
 static void Ms100Task(void) {
   DigIo::led_out.Toggle();
   iwdg_reset();
+  utils::MeasurementWatchdogTask100Ms();
   float cpuLoad = scheduler->GetCpuLoad() / 10.0f;
   Param::SetFloat(Param::cpuload, cpuLoad);
   Param::SetInt(Param::lasterr, ErrorMessage::GetLastError());
