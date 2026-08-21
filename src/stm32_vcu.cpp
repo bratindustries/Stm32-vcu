@@ -150,6 +150,8 @@ static volatile unsigned days = 0, hours = 0, minutes = 0, seconds = 0,
 
 static uint16_t rlyDly = 25;
 static uint16_t prechargeMinTime = 100;
+static const uint16_t COOLANT_PUMP_DELAY = 25; // 250 ms in the 10 ms task
+static uint16_t coolantPumpDelay = COOLANT_PUMP_DELAY;
 
 // Instantiate Classes
 static BMW_E31 e31Vehicle;
@@ -758,7 +760,8 @@ static void Ms10Task(void) {
       DigIo::inv_out.Set(); // inverter power on
     }
     IOMatrix::GetPinOut(IOMatrix::NEGCONTACTOR)->Set();
-    IOMatrix::GetPinOut(IOMatrix::COOLANTPUMP)->Set();
+    IOMatrix::GetPinOut(IOMatrix::COOLANTPUMP)->Clear();
+    coolantPumpDelay = COOLANT_PUMP_DELAY;
     if (rlyDly != 0)
       rlyDly--; // here we are going to pause before energising precharge to
                 // prevent too many contactors pulling amps at the same time
@@ -805,6 +808,8 @@ static void Ms10Task(void) {
 
   case MOD_PCHFAIL:
     StartSig = false;
+    IOMatrix::GetPinOut(IOMatrix::COOLANTPUMP)->Clear();
+    coolantPumpDelay = COOLANT_PUMP_DELAY;
     DigIo::prec_out
         .Clear(); // explicitly turn off precharge relay in a fail condition
     if (initbyCharge && !chargeMode)
@@ -822,6 +827,12 @@ static void Ms10Task(void) {
                 // prevent too many contactors pulling amps at the same time
     if (rlyDly == 0) {
       DigIo::dcsw_out.Set();
+      if (coolantPumpDelay != 0) {
+        coolantPumpDelay--;
+        IOMatrix::GetPinOut(IOMatrix::COOLANTPUMP)->Clear();
+      } else {
+        IOMatrix::GetPinOut(IOMatrix::COOLANTPUMP)->Set();
+      }
     }
     ErrorMessage::UnpostAll();
     if (!chargeMode) {
@@ -838,6 +849,12 @@ static void Ms10Task(void) {
     if (rlyDly == 0) {
       DigIo::dcsw_out.Set();
       DigIo::inv_out.Set(); // inverter power on
+      if (coolantPumpDelay != 0) {
+        coolantPumpDelay--;
+        IOMatrix::GetPinOut(IOMatrix::COOLANTPUMP)->Clear();
+      } else {
+        IOMatrix::GetPinOut(IOMatrix::COOLANTPUMP)->Set();
+      }
     }
     Param::SetInt(Param::opmode, MOD_RUN);
     ErrorMessage::UnpostAll();
@@ -854,6 +871,12 @@ static void Ms10Task(void) {
                 // prevent too many contactors pulling amps at the same time
     if (rlyDly == 0) {
       DigIo::dcsw_out.Set();
+      if (coolantPumpDelay != 0) {
+        coolantPumpDelay--;
+        IOMatrix::GetPinOut(IOMatrix::COOLANTPUMP)->Clear();
+      } else {
+        IOMatrix::GetPinOut(IOMatrix::COOLANTPUMP)->Set();
+      }
     }
 
     preheater.Ms10Task();
