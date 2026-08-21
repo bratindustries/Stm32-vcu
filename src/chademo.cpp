@@ -244,11 +244,11 @@ void FCChademo::Task200Ms() {
   Param::SetInt(Param::CCS_V_Avail, FCChademo::GetChargerMaxVoltage());
 }
 
-bool FCChademo::DCFCRequest(bool RunCh) {
+bool FCChademo::DCFCRequest(bool RunDCChg) {
   bool request = IOMatrix::GetPinIn(IOMatrix::DCFCREQUEST)->Get();
 
   // A real high is always required to start a new CHAdeMO session.
-  if (RunCh && request) {
+  if (RunDCChg && request) {
     dcfcSessionActive = true;
     dcfcDropoutTicks = 0;
     return true;
@@ -258,13 +258,14 @@ bool FCChademo::DCFCRequest(bool RunCh) {
   // DCFCRequest() is evaluated from the 100ms task, so 6 ticks is ~600ms.
   // Only tolerate control-signal dropouts after the CHAdeMO session
   // has started and the CHAdeMO task has begun running.
-  if (RunCh && dcfcSessionActive && chademoStartTime != 0 &&
+  if (RunDCChg && dcfcSessionActive && chademoStartTime != 0 &&
       dcfcDropoutTicks < DCFC_DROPOUT_LIMIT) {
     dcfcDropoutTicks++;
     return true;
   }
 
-  // Persistent loss of the hardwired request, or RunCh being removed, ends the session.
+  // Persistent loss of the hardwired request, or DC charge permission being
+  // removed, ends the session.
   // Guarded by dcfcSessionActive to prevent continuously spamming shutdown commands
   // over CAN/GPIOs while the vehicle is idle.
   if (dcfcSessionActive) {

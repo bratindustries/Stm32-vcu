@@ -130,7 +130,8 @@ static ChargeModes targetCharger;
 static ChargeInterfaces targetChgint;
 static uint8_t ChgSet; // Temp variable storing Param::Chgctrl. 0=enable,
                        // 1=disable, 2=timer.
-static bool RunChg;
+static bool RunACChg = false;
+static bool RunDCChg = false;
 static uint8_t ChgHrs_tmp;
 static uint8_t ChgMins_tmp;
 static uint16_t ChgDur_tmp;
@@ -149,8 +150,6 @@ static volatile unsigned days = 0, hours = 0, minutes = 0, seconds = 0,
 
 static uint16_t rlyDly = 25;
 static uint16_t prechargeMinTime = 100;
-static const uint16_t COOLANT_PUMP_DELAY = 25; // 250 ms in the 10 ms task
-static uint16_t coolantPumpDelay = COOLANT_PUMP_DELAY;
 
 // Instantiate Classes
 static BMW_E31 e31Vehicle;
@@ -241,7 +240,7 @@ static void Ms200Task(void) {
   Param::SetInt(Param::uptime, rtc_get_counter_val());
   Param::SetInt(Param::ChgT, ChgDur_tmp);
 
-  // Setting of RunChg - main okay to charge param
+  // Set the main AC and DC charge permissions.
 
   if (ChgSet == 2 && !ChgLck) // if in timer mode and not locked out from a
                               // previous full charge.
@@ -249,10 +248,10 @@ static void Ms200Task(void) {
     if (opmode != MOD_CHARGE) {
       if ((ChgHrs_tmp == hours) && (ChgMins_tmp == minutes) &&
           (ChgDur_tmp != 0))
-        RunChg = true; // if we arrive at set charge time and duration is non
-                       // zero then initiate charge
+        RunACChg = RunDCChg = true; // if we arrive at set charge time and
+                                    // duration is non-zero, allow charging
       else
-        RunChg = false;
+        RunACChg = RunDCChg = false;
     }
 
     if (opmode == MOD_CHARGE) {
@@ -262,7 +261,8 @@ static void Ms200Task(void) {
       }
 
       if (ChgTicks == 0) {
-        RunChg = false; // end charge if still charging once timer expires.
+        RunACChg = RunDCChg =
+            false; // end charge if still charging once timer expires.
         ChgTicks = (GetInt(Param::Chg_Dur) * 300); // recharge the tick timer
       }
 
@@ -273,12 +273,13 @@ static void Ms200Task(void) {
     }
   }
   if (ChgSet == 0 && !ChgLck)
-    RunChg = true; // enable from webui if we are not locked out from an auto
-                   // termination
+    RunACChg = RunDCChg =
+        true; // enable from webui if we are not locked out from an auto
+              // termination
   if (ChgSet == 1)
-    RunChg = false; // disable from webui
+    RunACChg = RunDCChg = false; // disable from webui
 
-  // Handle PP on the Charging port - Changes RunChg
+  // Handle PP on the charging port. Proximity pilot only controls AC charging.
   if (Param::GetInt(Param::GPA1Func) == IOMatrix::PILOT_PROX ||
       Param::GetInt(Param::GPA2Func) == IOMatrix::PILOT_PROX) {
     int ppThresh = Param::GetInt(Param::ppthresh);
@@ -289,19 +290,19 @@ static void Ms200Task(void) {
     // finished
     if (ppValue <= ppThresh) {
       if (ChgSet == 1 && !ChgLck) {
-        RunChg = true;
+        RunACChg = true;
       }
       Param::SetInt(Param::PlugDet, 1);
     } else if (ppValue > ppThresh) {
       // even if timer was enabled, change to disabled, we've unplugged
-      RunChg = false;
+      RunACChg = false;
       Param::SetInt(Param::PlugDet, 0);
     }
   }
-  // END Setting of RunChg - main okay to charge param
+  // END setting of AC and DC charge permissions
 
   // Check if we want to AC charge via charger
-  if (selectedCharger->ControlCharge(RunChg, ACrequest) &&
+  if (selectedCharger->ControlCharge(RunACChg, ACrequest) &&
       (opmode != MOD_RUN)) {
     chargeMode = true; // AC charge mode
     Param::SetInt(Param::chgtyp, AC);
@@ -321,15 +322,15 @@ static void Ms200Task(void) {
   if (opmode == MOD_CHARGE && !chargeModeDC) {
     if (Param::GetInt(Param::udc) >= Param::GetInt(Param::Voltspnt) &&
         Param::GetInt(Param::idc) <= Param::GetInt(Param::IdcTerm)) {
-      RunChg = false; // end charge
-      ChgLck = true;  // set charge lockout flag
+      RunACChg = RunDCChg = false; // end charge
+      ChgLck = true;                // set charge lockout flag
     }
 
     if (selectedBMS->MaxChargeCurrent() ==
         0) // BMS can command an AC charge shutdown if its current limit is 0
     {
-      RunChg = false; // end charge
-      ChgLck = true;  // set charge lockout flag
+      RunACChg = RunDCChg = false; // end charge
+      ChgLck = true;                // set charge lockout flag
     }
   }
   // End Charge Term Logic
@@ -450,9 +451,9 @@ static void Ms100Task(void) {
         ->Task100Ms(); // send the 100ms task request for the lim all the time
                        // and for others if in DC charge mode
 
-  if (selectedChargeInt->DCFCRequest(RunChg) ||
-      ExtHVreq) // Request to run dc fast charge via charge interface or
-                // external pin io
+  if (selectedChargeInt->DCFCRequest(RunDCChg) ||
+      (RunDCChg && ExtHVreq)) // Request to run dc fast charge via charge
+                              // interface or permitted external pin IO
   {
     // Here we receive a valid DCFC startup request.
     if (opmode != MOD_RUN)
@@ -467,8 +468,7 @@ static void Ms100Task(void) {
   if (!chargeModeDC) // Request to run ac charge from the interface (e.g. LIM)
                      // if we are NOT in DC charge mode.
   {
-    ACrequest = selectedChargeInt->ACRequest(
-        RunChg); // If using unused always returns true
+    ACrequest = selectedChargeInt->ACRequest(RunACChg);
   }
   // End charge interface logic
 
@@ -758,8 +758,7 @@ static void Ms10Task(void) {
       DigIo::inv_out.Set(); // inverter power on
     }
     IOMatrix::GetPinOut(IOMatrix::NEGCONTACTOR)->Set();
-    IOMatrix::GetPinOut(IOMatrix::COOLANTPUMP)->Clear();
-    coolantPumpDelay = COOLANT_PUMP_DELAY;
+    IOMatrix::GetPinOut(IOMatrix::COOLANTPUMP)->Set();
     if (rlyDly != 0)
       rlyDly--; // here we are going to pause before energising precharge to
                 // prevent too many contactors pulling amps at the same time
@@ -806,8 +805,6 @@ static void Ms10Task(void) {
 
   case MOD_PCHFAIL:
     StartSig = false;
-    IOMatrix::GetPinOut(IOMatrix::COOLANTPUMP)->Clear();
-    coolantPumpDelay = COOLANT_PUMP_DELAY;
     DigIo::prec_out
         .Clear(); // explicitly turn off precharge relay in a fail condition
     if (initbyCharge && !chargeMode)
@@ -825,12 +822,6 @@ static void Ms10Task(void) {
                 // prevent too many contactors pulling amps at the same time
     if (rlyDly == 0) {
       DigIo::dcsw_out.Set();
-      if (coolantPumpDelay != 0) {
-        coolantPumpDelay--;
-        IOMatrix::GetPinOut(IOMatrix::COOLANTPUMP)->Clear();
-      } else {
-        IOMatrix::GetPinOut(IOMatrix::COOLANTPUMP)->Set();
-      }
     }
     ErrorMessage::UnpostAll();
     if (!chargeMode) {
@@ -847,12 +838,6 @@ static void Ms10Task(void) {
     if (rlyDly == 0) {
       DigIo::dcsw_out.Set();
       DigIo::inv_out.Set(); // inverter power on
-      if (coolantPumpDelay != 0) {
-        coolantPumpDelay--;
-        IOMatrix::GetPinOut(IOMatrix::COOLANTPUMP)->Clear();
-      } else {
-        IOMatrix::GetPinOut(IOMatrix::COOLANTPUMP)->Set();
-      }
     }
     Param::SetInt(Param::opmode, MOD_RUN);
     ErrorMessage::UnpostAll();
@@ -869,12 +854,6 @@ static void Ms10Task(void) {
                 // prevent too many contactors pulling amps at the same time
     if (rlyDly == 0) {
       DigIo::dcsw_out.Set();
-      if (coolantPumpDelay != 0) {
-        coolantPumpDelay--;
-        IOMatrix::GetPinOut(IOMatrix::COOLANTPUMP)->Clear();
-      } else {
-        IOMatrix::GetPinOut(IOMatrix::COOLANTPUMP)->Set();
-      }
     }
 
     preheater.Ms10Task();
@@ -1392,10 +1371,6 @@ int main(void) {
   Param::Change(Param::PARAM_LAST);
   DigIo::inv_out.Clear(); // inverter power off during bootup
   DigIo::mcp_sby.Clear(); // enable can3
-
-  DigIo::CANEN.Set();//enable can1 on V1.3 HW
-  DigIo::CANSBY.Set();
-
 
   Terminal t(USART3, TermCmds, false, true, !Param::GetBool(Param::UseRS232));
   //   FunctionPointerCallback canCb(CanCallback, SetCanFilters);

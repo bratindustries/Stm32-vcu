@@ -2,6 +2,7 @@
  * This file is part of the tumanako_vc project.
  *
  * Copyright (C) 2018 Johannes Huebner <dev@johanneshuebner.com>
+ * changes by Angus Johnson 2026 <info@bratindustries.net>
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -33,7 +34,7 @@ public:
   void DecodeCAN(int id, uint32_t data[2]);
   void Task100Ms(); // Must be called every 100ms
   void Task200Ms();
-  bool DCFCRequest(bool RunCh);
+  bool DCFCRequest(bool RunDCChg);
   bool ACRequest(bool RunCh) { return RunCh; };
 
 protected:

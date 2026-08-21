@@ -3,6 +3,7 @@
  *
  * Copyright (C) 2021-2023  Johannes Huebner <dev@johanneshuebner.com>
  * 	                        Damien Maguire <info@evbmw.com>
+ * changes by Angus Johnson 2026 <info@bratindustries.net>
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -23,10 +24,14 @@
 
 /* Control of the Mitsubishi Outlander PHEV on board charger (OBC) and DCDC
  * Converter. */
-#define TIMERRESET 300 // time out timer reset value
+#define TIMERRESET 300 // 30 seconds in the 100ms task
+#define EVSEDUTYSTALE 5 // 500ms without 0x38A makes the pilot reading stale
+#define OUTLANDERMAXCURRENT 0x78 // 12.0A DC, 0.1A per bit
+#define MINIMUMACVOLTS 100 // conservative startup value before 0x389 updates
 
 uint8_t outlanderCharger::chgStatus;
 uint8_t outlanderCharger::evseDuty;
+uint8_t outlanderCharger::evseDutyAge = 0xff;
 float outlanderCharger::dcBusV;
 float outlanderCharger::temp_1;
 float outlanderCharger::temp_2;
@@ -42,7 +47,31 @@ bool EvseTimeout =
 uint16_t EvseTimer = TIMERRESET; // counts of 100ms before timing out for CP
                                  // Duty
 
+static uint16_t EvseCurrentLimit(uint8_t duty) {
+  // SAE J1772/IEC 61851 control-pilot duty cycle converted to 0.1A AC.
+  if (duty >= 10 && duty <= 85)
+    return duty * 6;
+  if (duty > 85 && duty <= 96)
+    return (duty - 64) * 25;
+  return 0;
+}
+
 bool outlanderCharger::ControlCharge(bool RunCh, bool ACReq) {
+  bool proxRequest = RunCh && Param::GetBool(Param::PlugDet);
+
+  // When the Outlander charger is selected, PP can start AC charging without
+  // depending on the selected charge interface. The OBC is brought into
+  // MOD_CHARGE first so its heartbeat can wake it and obtain EVSE duty.
+  if (proxRequest) {
+    clearToStart = !EvseTimeout;
+    return clearToStart;
+  }
+
+  // Removing charge permission or unplugging resets a pilot timeout so the
+  // next plug-in is allowed to make a new attempt.
+  EvseTimeout = false;
+  EvseTimer = TIMERRESET;
+
   int chgmode = Param::GetInt(Param::interface);
   switch (chgmode) {
   case Unused:
@@ -60,8 +89,6 @@ bool outlanderCharger::ControlCharge(bool RunCh, bool ACReq) {
       }
 
     } else {
-      EvseTimeout = false;    // reset EVSE CP duty timeout
-      EvseTimer = TIMERRESET; // reset EVSE CP duty timer
       clearToStart = false;
       return false;
     }
@@ -142,10 +169,26 @@ void outlanderCharger::DecodeCAN(int id, uint32_t data[2]) {
 }
 
 void outlanderCharger::Task100Ms() {
+  static bool wasInCharge = false;
   int opmode = Param::GetInt(Param::opmode);
   if (opmode == MOD_CHARGE) {
-    if (evseDuty == 0) // if no CP duty recieved
-    {
+    // Do not accept a duty value left over from an earlier charge session.
+    if (!wasInCharge) {
+      evseDuty = 0;
+      evseDutyAge = 0xff;
+      currentRamp = 0;
+      EvseTimer = TIMERRESET;
+      EvseTimeout = false;
+      wasInCharge = true;
+    }
+
+    uint16_t evseCurrent = EvseCurrentLimit(evseDuty);
+    bool pilotValid = evseDutyAge <= EVSEDUTYSTALE && evseCurrent > 0;
+
+    if (evseDutyAge < 0xff)
+      evseDutyAge++;
+
+    if (!pilotValid) {
       if (EvseTimer > 0) {
         EvseTimer--;
       } else {
@@ -159,6 +202,24 @@ void outlanderCharger::Task100Ms() {
     setVolts = Param::GetInt(Param::Voltspnt) * 10;
     actVolts = Param::GetInt(Param::udc);
     uint8_t bytes[8];
+
+    // 0x286 requests DC output current. Convert the AC pilot allowance to a
+    // conservative DC-side limit using AC and DC voltage, then retain the
+    // Outlander charger's existing 12A hardware cap. Until 0x389 reports AC
+    // voltage, use a conservative startup value so the current can still ramp.
+    uint16_t maxCurrent = 0;
+    if (pilotValid && actVolts > 0) {
+      uint16_t inputVolts = ACVolts >= MINIMUMACVOLTS
+                                ? (uint16_t)ACVolts
+                                : MINIMUMACVOLTS;
+      maxCurrent =
+          (uint32_t)evseCurrent * inputVolts * 9 / actVolts / 10;
+      if (maxCurrent > OUTLANDERMAXCURRENT)
+        maxCurrent = OUTLANDERMAXCURRENT;
+    }
+
+    if (!pilotValid || currentRamp > maxCurrent)
+      currentRamp = maxCurrent;
 
     if (clearToStart) {
       OutlanderHeartBeat::SetPullInEVSE(1);
@@ -177,19 +238,20 @@ void outlanderCharger::Task100Ms() {
     bytes[6] = 0x00;
     bytes[7] = 0x00;
     can->Send(0x286, (uint32_t *)bytes, 8);
-    if (clearToStart) {
-      if (actVolts < Param::GetInt(Param::Voltspnt))
+    if (clearToStart && pilotValid) {
+      if (actVolts < Param::GetInt(Param::Voltspnt) &&
+          currentRamp < maxCurrent)
         currentRamp++;
-      if (actVolts >= Param::GetInt(Param::Voltspnt))
+      if (actVolts >= Param::GetInt(Param::Voltspnt) && currentRamp > 0)
         currentRamp--;
-      if (currentRamp >= 0x78)
-        currentRamp = 0x78; // clamp to max of 12A
       Charging = true;
     } else {
       currentRamp = 0;
     }
 
   } else {
+    wasInCharge = false;
+    currentRamp = 0;
     Charging = false;
     OutlanderHeartBeat::SetPullInEVSE(0);
   }
@@ -239,6 +301,7 @@ void outlanderCharger::handle38A(uint32_t data[2])
                        // See comments are useful:)
   chgStatus = bytes[4];
   evseDuty = bytes[3];
+  evseDutyAge = 0;
 
   dcBusV = bytes[2] * 2;  // Volts scale 2
   temp_1 = bytes[0] - 45; // degC bias -45
