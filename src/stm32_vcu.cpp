@@ -214,6 +214,9 @@ static Preheater preheater;
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 static void Ms200Task(void) {
   int opmode = Param::GetInt(Param::opmode);
+  const bool proxPilotConfigured =
+      Param::GetInt(Param::GPA1Func) == IOMatrix::PILOT_PROX ||
+      Param::GetInt(Param::GPA2Func) == IOMatrix::PILOT_PROX;
 
   selectedVehicle->Task200Ms();
   if (opmode == MOD_CHARGE)
@@ -282,8 +285,7 @@ static void Ms200Task(void) {
     RunACChg = RunDCChg = false; // disable from webui
 
   // Handle PP on the charging port. Proximity pilot only controls AC charging.
-  if (Param::GetInt(Param::GPA1Func) == IOMatrix::PILOT_PROX ||
-      Param::GetInt(Param::GPA2Func) == IOMatrix::PILOT_PROX) {
+  if (proxPilotConfigured) {
     int ppThresh = Param::GetInt(Param::ppthresh);
     int ppValue = IOMatrix::GetAnaloguePin(IOMatrix::PILOT_PROX)->Get();
     Param::SetInt(Param::PPVal, ppValue);
@@ -298,14 +300,21 @@ static void Ms200Task(void) {
     } else if (ppValue > ppThresh) {
       // even if timer was enabled, change to disabled, we've unplugged
       RunACChg = false;
+      ChgLck = false; // physical unplug permits the next AC charge session
       Param::SetInt(Param::PlugDet, 0);
     }
   }
+
+  // A completed AC charge remains inhibited while the cable is connected.
+  if (ChgLck)
+    RunACChg = false;
+
   // END setting of AC and DC charge permissions
 
   // Check if we want to AC charge via charger
-  if (selectedCharger->ControlCharge(RunACChg, ACrequest) &&
-      (opmode != MOD_RUN)) {
+  bool acChargeRequested =
+      selectedCharger->ControlCharge(RunACChg && !ChgLck, ACrequest);
+  if (!ChgLck && acChargeRequested && (opmode != MOD_RUN)) {
     chargeMode = true; // AC charge mode
     Param::SetInt(Param::chgtyp, AC);
   } else if (!chargeModeDC) {
@@ -324,21 +333,24 @@ static void Ms200Task(void) {
   if (opmode == MOD_CHARGE && !chargeModeDC) {
     if (Param::GetInt(Param::udc) >= Param::GetInt(Param::Voltspnt) &&
         Param::GetInt(Param::idc) <= Param::GetInt(Param::IdcTerm)) {
-      RunACChg = RunDCChg = false; // end charge
-      ChgLck = true;                // set charge lockout flag
+      RunACChg = false; // end AC charge without changing DC permission
+      ChgLck = true;    // inhibit another AC session until physical unplug
     }
 
     if (selectedBMS->MaxChargeCurrent() ==
         0) // BMS can command an AC charge shutdown if its current limit is 0
     {
-      RunACChg = RunDCChg = false; // end charge
-      ChgLck = true;                // set charge lockout flag
+      RunACChg = false; // end AC charge without changing DC permission
+      ChgLck = true;    // inhibit another AC session until physical unplug
     }
   }
   // End Charge Term Logic
 
   if (opmode == MOD_RUN) {
-    ChgLck = false; // reset charge lockout flag when we drive off
+    // Preserve the legacy reset for installations without proximity pilot.
+    // With PP configured, only a confirmed physical unplug clears ChgLck.
+    if (!proxPilotConfigured)
+      ChgLck = false;
 
     // Brake Vac Sensor
     if (Param::GetInt(Param::GPA1Func) == IOMatrix::VAC_SENSOR ||
