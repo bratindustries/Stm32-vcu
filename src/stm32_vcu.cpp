@@ -131,7 +131,8 @@ static ChargeInterfaces targetChgint;
 static uint8_t ChgSet; // Temp variable storing Param::Chgctrl. 0=enable,
                        // 1=disable, 2=timer.
 static bool RunACChg = false;
-static bool RunDCChg = false;
+static bool RunDCChg = true; // DC charging is controlled by its interface,
+                             // not by Chgctrl.
 static uint8_t ChgHrs_tmp;
 static uint8_t ChgMins_tmp;
 static uint16_t ChgDur_tmp;
@@ -253,21 +254,20 @@ static void Ms200Task(void) {
     if (opmode != MOD_CHARGE) {
       if ((ChgHrs_tmp == hours) && (ChgMins_tmp == minutes) &&
           (ChgDur_tmp != 0))
-        RunACChg = RunDCChg = true; // if we arrive at set charge time and
-                                    // duration is non-zero, allow charging
+        RunACChg = true; // if we arrive at set charge time and duration is
+                         // non-zero, allow AC charging
       else
-        RunACChg = RunDCChg = false;
+        RunACChg = false;
     }
 
-    if (opmode == MOD_CHARGE) {
+    if (opmode == MOD_CHARGE && !chargeModeDC) {
       if (ChgTicks != 0) {
         ChgTicks--; // decrement charge timer ticks
         ChgTicks_1Min++;
       }
 
       if (ChgTicks == 0) {
-        RunACChg = RunDCChg =
-            false; // end charge if still charging once timer expires.
+        RunACChg = false; // end AC charge if still charging when timer expires
         ChgTicks = (GetInt(Param::Chg_Dur) * 300); // recharge the tick timer
       }
 
@@ -278,11 +278,10 @@ static void Ms200Task(void) {
     }
   }
   if (ChgSet == 0 && !ChgLck)
-    RunACChg = RunDCChg =
-        true; // enable from webui if we are not locked out from an auto
-              // termination
+    RunACChg = true; // enable AC charging from webui if we are not locked out
+                     // from an automatic termination
   if (ChgSet == 1)
-    RunACChg = RunDCChg = false; // disable from webui
+    RunACChg = false; // disable AC charging from webui
 
   // Handle PP on the charging port. Proximity pilot only controls AC charging.
   if (proxPilotConfigured) {
