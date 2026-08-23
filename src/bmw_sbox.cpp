@@ -140,7 +140,8 @@ void SBOX::handle220(uint32_t data[2]) // SBOX Output voltage
   }
 }
 
-void SBOX::ControlContactors(int opmode, CanHardware *can) {
+void SBOX::ControlContactors(int opmode, bool prechargeComplete,
+                            CanHardware *can) {
   uint8_t bytes[8];
   bytes[0] = 0xFF; // sems to control the iso relay
   bytes[1] = 0xFE; // needs to be 0xFE to enable contactors.
@@ -165,15 +166,15 @@ void SBOX::ControlContactors(int opmode, CanHardware *can) {
   case 0:
     CCByte = 0x00; // all contactors off
     break;
-  case 2:          // Precharge
-    CCByte = 0xA6; // Prech and Neg contactors activated
+  case 2: // Precharge
+    CCByte = prechargeComplete
+                 ? 0xAA  // Successful precharge: all contactors activated
+                 : 0xA6; // Precharge and negative contactors activated
     break;
 
   case 1:          // Run
-    CCByte = 0xAA; // All contactors activated
-    break;
-
   case 4:          // Charge
+  case 5:          // Preheat
     CCByte = 0xAA; // All contactors activated
     break;
 

@@ -149,7 +149,10 @@ static volatile unsigned days = 0, hours = 0, minutes = 0, seconds = 0,
 
 static uint16_t rlyDly = 25;
 static uint16_t prechargeMinTime = 100;
-static const uint16_t COOLANT_PUMP_DELAY = 25; // 250 ms in the 10 ms task
+static const uint16_t DCSW_DELAY = 25; // 250 ms in the 10 ms task
+static uint16_t dcswDelay = DCSW_DELAY;
+static bool dcswCommanded = false;
+static const uint16_t COOLANT_PUMP_DELAY = 25; // 250 ms after HVACTIVE is set
 static uint16_t coolantPumpDelay = COOLANT_PUMP_DELAY;
 
 // Instantiate Classes
@@ -563,13 +566,6 @@ static void Ms100Task(void) {
     IOMatrix::GetPinOut(IOMatrix::COOLINGFAN)->Clear(); // Coolant Fan Off
   }
 
-  // HV Active output
-  if (opmode == MOD_CHARGE || opmode == MOD_RUN || opmode == MOD_PREHEAT) {
-    IOMatrix::GetPinOut(IOMatrix::HVACTIVE)->Set(); // HV Active On
-  } else {
-    IOMatrix::GetPinOut(IOMatrix::HVACTIVE)->Clear(); // HV Active Off
-  }
-
   // ShiftLock Out output
   if (opmode == MOD_RUN && Param::GetInt(Param::ShiftLock) == 1) {
     IOMatrix::GetPinOut(IOMatrix::SHIFTLOCKNO)->Set(); // Shift Lock Out On
@@ -692,6 +688,15 @@ static void Ms10Task(void) {
   stt |= udc < Param::GetFloat(Param::udclim) ? STAT_NONE : STAT_UDCLIM;
   Param::SetInt(Param::status, stt);
 
+  bool prechargeRequestActive =
+      (StartSig || chargeMode || preheater.GetRunPreHeat()) &&
+      (!initbyStart || selectedVehicle->Ready()) &&
+      (!initbyCharge || chargeMode) &&
+      (!preheater.GetInitByPreHeat() || preheater.GetRunPreHeat());
+  bool prechargeValid =
+      (prechargeMinTime == 0) &&
+      (stt & (STAT_POTPRESSED | STAT_UDCBELOWUDCSW | STAT_UDCLIM)) == 0;
+
   switch (opmode) {
   case MOD_OFF:
     initbyStart = false;
@@ -701,6 +706,10 @@ static void Ms10Task(void) {
     DigIo::inv_out.Clear();                              // inverter power off
     IOMatrix::GetPinOut(IOMatrix::COOLANTPUMP)->Clear(); // Coolant pump off if
                                                          // used
+    IOMatrix::GetPinOut(IOMatrix::HVACTIVE)->Clear();
+    dcswDelay = DCSW_DELAY;
+    dcswCommanded = false;
+    coolantPumpDelay = COOLANT_PUMP_DELAY;
     Param::SetInt(
         Param::dir,
         0); // shift to park/neutral on shutdown regardless of shifter pos
@@ -759,8 +768,6 @@ static void Ms10Task(void) {
       DigIo::inv_out.Set(); // inverter power on
     }
     IOMatrix::GetPinOut(IOMatrix::NEGCONTACTOR)->Set();
-    IOMatrix::GetPinOut(IOMatrix::COOLANTPUMP)->Clear();
-    coolantPumpDelay = COOLANT_PUMP_DELAY;
     if (rlyDly != 0)
       rlyDly--; // here we are going to pause before energising precharge to
                 // prevent too many contactors pulling amps at the same time
@@ -768,24 +775,45 @@ static void Ms10Task(void) {
       DigIo::prec_out.Set(); // commence precharge
     if (prechargeMinTime != 0)
       prechargeMinTime--; // 1 second minimum precharge time
-    if ((prechargeMinTime == 0) &&
-        (stt & (STAT_POTPRESSED | STAT_UDCBELOWUDCSW | STAT_UDCLIM)) ==
-            0) // Clarify operator precedence, exit precharge: time met and no
-               // faults
-    {
-      if (StartSig) {
-        opmode = MOD_RUN;
-        StartSig = false;                    // reset for next time
-        rlyDly = 25;                         // Recharge sequence timer
+    if (!prechargeValid || !prechargeRequestActive) {
+      dcswDelay = DCSW_DELAY;
+      dcswCommanded = false;
+      coolantPumpDelay = COOLANT_PUMP_DELAY;
+      DigIo::dcsw_out.Clear();
+      IOMatrix::GetPinOut(IOMatrix::HVACTIVE)->Clear();
+      IOMatrix::GetPinOut(IOMatrix::COOLANTPUMP)->Clear();
+    } else if (!dcswCommanded) {
+      DigIo::dcsw_out.Clear();
+      IOMatrix::GetPinOut(IOMatrix::HVACTIVE)->Clear();
+      IOMatrix::GetPinOut(IOMatrix::COOLANTPUMP)->Clear();
+
+      if (dcswDelay != 0)
+        dcswDelay--; // Keep precharge valid for 250 ms before setting DCSW.
+
+      if (dcswDelay == 0) {
+        DigIo::dcsw_out.Set();
+        IOMatrix::GetPinOut(IOMatrix::HVACTIVE)->Set();
+        dcswCommanded = true;
+        coolantPumpDelay = COOLANT_PUMP_DELAY;
+      }
+    } else {
+      if (coolantPumpDelay != 0)
+        coolantPumpDelay--;
+
+      if (coolantPumpDelay == 0) {
+        IOMatrix::GetPinOut(IOMatrix::COOLANTPUMP)->Set();
+
+        if (StartSig) {
+          opmode = MOD_RUN;
+          StartSig = false; // reset for next time
+        } else if (chargeMode) {
+          opmode = MOD_CHARGE;
+        } else if (preheater.GetRunPreHeat()) {
+          opmode = MOD_PREHEAT;
+        }
         Param::SetInt(Param::TorqDerate, 0); // clear torque derate reason
-      } else if (chargeMode) {
-        opmode = MOD_CHARGE;
-        rlyDly = 25;                         // Recharge sequence timer
-        Param::SetInt(Param::TorqDerate, 0); // clear torque derate reason
-      } else if (preheater.GetRunPreHeat()) {
-        opmode = MOD_PREHEAT;
-        rlyDly = 25;                         // Recharge sequence timer
-        Param::SetInt(Param::TorqDerate, 0); // clear torque derate reason
+      } else {
+        IOMatrix::GetPinOut(IOMatrix::COOLANTPUMP)->Clear();
       }
     }
     if (initbyCharge && !chargeMode)
@@ -808,7 +836,11 @@ static void Ms10Task(void) {
   case MOD_PCHFAIL:
     StartSig = false;
     IOMatrix::GetPinOut(IOMatrix::COOLANTPUMP)->Clear();
+    IOMatrix::GetPinOut(IOMatrix::HVACTIVE)->Clear();
+    dcswDelay = DCSW_DELAY;
+    dcswCommanded = false;
     coolantPumpDelay = COOLANT_PUMP_DELAY;
+    DigIo::dcsw_out.Clear();
     DigIo::prec_out
         .Clear(); // explicitly turn off precharge relay in a fail condition
     if (initbyCharge && !chargeMode)
@@ -821,18 +853,6 @@ static void Ms10Task(void) {
     break;
 
   case MOD_CHARGE:
-    if (rlyDly != 0)
-      rlyDly--; // here we are going to pause before energising precharge to
-                // prevent too many contactors pulling amps at the same time
-    if (rlyDly == 0) {
-      DigIo::dcsw_out.Set();
-      if (coolantPumpDelay != 0) {
-        coolantPumpDelay--;
-        IOMatrix::GetPinOut(IOMatrix::COOLANTPUMP)->Clear();
-      } else {
-        IOMatrix::GetPinOut(IOMatrix::COOLANTPUMP)->Set();
-      }
-    }
     ErrorMessage::UnpostAll();
     if (!chargeMode) {
       opmode = MOD_OFF;
@@ -842,19 +862,7 @@ static void Ms10Task(void) {
     break;
 
   case MOD_RUN:
-    if (rlyDly != 0)
-      rlyDly--; // here we are going to pause before energising precharge to
-                // prevent too many contactors pulling amps at the same time
-    if (rlyDly == 0) {
-      DigIo::dcsw_out.Set();
-      DigIo::inv_out.Set(); // inverter power on
-      if (coolantPumpDelay != 0) {
-        coolantPumpDelay--;
-        IOMatrix::GetPinOut(IOMatrix::COOLANTPUMP)->Clear();
-      } else {
-        IOMatrix::GetPinOut(IOMatrix::COOLANTPUMP)->Set();
-      }
-    }
+    DigIo::inv_out.Set(); // inverter power on
     Param::SetInt(Param::opmode, MOD_RUN);
     ErrorMessage::UnpostAll();
     if (!selectedVehicle->Ready()) {
@@ -865,19 +873,6 @@ static void Ms10Task(void) {
     break;
 
   case MOD_PREHEAT:
-    if (rlyDly != 0)
-      rlyDly--; // here we are going to pause before energising precharge to
-                // prevent too many contactors pulling amps at the same time
-    if (rlyDly == 0) {
-      DigIo::dcsw_out.Set();
-      if (coolantPumpDelay != 0) {
-        coolantPumpDelay--;
-        IOMatrix::GetPinOut(IOMatrix::COOLANTPUMP)->Clear();
-      } else {
-        IOMatrix::GetPinOut(IOMatrix::COOLANTPUMP)->Set();
-      }
-    }
-
     preheater.Ms10Task();
 
     if (!preheater.GetRunPreHeat()) {
@@ -888,13 +883,14 @@ static void Ms10Task(void) {
 
   ControlCabHeater(opmode);
   if (Param::GetInt(Param::ShuntType) == 2)
-    SBOX::ControlContactors(
-        opmode,
-        canInterface[Param::GetInt(Param::ShuntCan)]); // BMW contactor box
-  if (Param::GetInt(Param::ShuntType) == 3)
-    VWBOX::ControlContactors(
-        opmode,
-        canInterface[Param::GetInt(Param::ShuntCan)]); // VW contactor box
+  SBOX::ControlContactors(
+      opmode, dcswCommanded,
+      canInterface[Param::GetInt(Param::ShuntCan)]); // BMW contactor box
+
+if (Param::GetInt(Param::ShuntType) == 3)
+  VWBOX::ControlContactors(
+      opmode, dcswCommanded,
+      canInterface[Param::GetInt(Param::ShuntCan)]); // VW contactor box
 }
 
 static void Ms1Task(void) {

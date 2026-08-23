@@ -41,7 +41,8 @@ class VWBOX {
 public:
   static void RegisterCanMessages(CanHardware *can);
   static void DecodeCAN(int id, uint32_t data[2]);
-  static void ControlContactors(int opmode, CanHardware *can);
+  static void ControlContactors(int opmode, bool prechargeComplete,
+                                CanHardware *can);
 
   static float Voltage;
   static float Voltage2;

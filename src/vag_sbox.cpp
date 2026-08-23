@@ -66,7 +66,8 @@ void VWBOX::handle0BB(uint32_t data[2]) // VWBOX Current and voltages
   utils::UdcReceived(utils::MEASUREMENT_VAG_SBOX);
 }
 
-void VWBOX::ControlContactors(int opmode, CanHardware *can) {
+void VWBOX::ControlContactors(int opmode, bool prechargeComplete,
+                             CanHardware *can) {
   uint8_t bytes[8];
   Sec1tmr++;
   if (Sec1tmr == 100) {
@@ -92,17 +93,15 @@ void VWBOX::ControlContactors(int opmode, CanHardware *can) {
     break;
   case 2: // Precharge
     bytes[2] = bytes[2] | 0x1;
-    ;                           // Neg on
-    bytes[1] = bytes[1] | 0x10; // Prech on
+    ; // Neg on
+    bytes[1] = bytes[1] |
+               (prechargeComplete ? 0x50 : 0x10); // Main + precharge, or
+                                                   // precharge only
     break;
 
   case 1: // Run
-    bytes[2] = bytes[2] | 0x1;
-    ;                           // Neg on
-    bytes[1] = bytes[1] | 0x50; // main on and prech on
-    break;
-
   case 4: // Charge
+  case 5: // Preheat
     bytes[2] = bytes[2] | 0x1;
     ;                           // Neg on
     bytes[1] = bytes[1] | 0x50; // main on and prech on
