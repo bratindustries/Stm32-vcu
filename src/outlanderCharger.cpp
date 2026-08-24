@@ -96,7 +96,10 @@ bool outlanderCharger::ControlCharge(bool RunCh, bool ACReq) {
     break;
 
   case Chademo:
-    if (evseDuty > 0 && RunCh) {
+    // Plug detection is handled by proxRequest above. Without PP, only a
+    // fresh, valid 0x38A pilot may start the CHAdeMO-interface AC fallback.
+    if (RunCh && evseDutyAge <= EVSEDUTYSTALE &&
+        EvseCurrentLimit(evseDuty) > 0) {
       clearToStart = true;
       return true;
     } else {
@@ -250,6 +253,15 @@ void outlanderCharger::Task100Ms() {
     }
 
   } else {
+    // Clear the pilot captured by the completed charge session. Continue
+    // ageing any 0x38A received while idle so the AC fallback cannot use a
+    // stale duty value indefinitely.
+    if (wasInCharge) {
+      evseDuty = 0;
+      evseDutyAge = 0xff;
+    } else if (evseDutyAge < 0xff) {
+      evseDutyAge++;
+    }
     wasInCharge = false;
     currentRamp = 0;
     Charging = false;
