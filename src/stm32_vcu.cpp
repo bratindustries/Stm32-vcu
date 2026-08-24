@@ -152,8 +152,13 @@ static uint16_t prechargeMinTime = 100;
 static const uint16_t DCSW_DELAY = 25; // 250 ms in the 10 ms task
 static uint16_t dcswDelay = DCSW_DELAY;
 static bool dcswCommanded = false;
+static const uint16_t HVACTIVE_DELAY = 1; // 10 ms after DCSW is set
+static uint16_t hvactiveDelay = HVACTIVE_DELAY;
+static bool hvactiveCommanded = false;
 static const uint16_t COOLANT_PUMP_DELAY = 25; // 250 ms after HVACTIVE is set
 static uint16_t coolantPumpDelay = COOLANT_PUMP_DELAY;
+static const uint16_t PRECHARGE_FAIL_NEG_DELAY = 5; // 50 ms in the 10 ms task
+static uint16_t prechargeFailNegDelay = PRECHARGE_FAIL_NEG_DELAY;
 
 // Instantiate Classes
 static BMW_E31 e31Vehicle;
@@ -591,6 +596,22 @@ static void ControlCabHeater(int opmode) {
   }
 }
 
+static void ClearPrechargeFailAuxOutputs() {
+  IOMatrix::GetPinOut(IOMatrix::COOLANTPUMP)->Clear();
+  IOMatrix::GetPinOut(IOMatrix::COOLINGFAN)->Clear();
+  IOMatrix::GetPinOut(IOMatrix::RUNINDICATION)->Clear();
+  IOMatrix::GetPinOut(IOMatrix::SHIFTLOCKNO)->Clear();
+  IOMatrix::GetPinOut(IOMatrix::PREHEATOUT)->Clear();
+  IOMatrix::GetPinOut(IOMatrix::BRAKEVACPUMP)->Clear();
+  IOMatrix::GetPinOut(IOMatrix::HEATERENABLE)->Clear();
+  IOMatrix::GetPinOut(IOMatrix::HVACTIVE)->Clear();
+}
+
+static void ClearPrechargeFailLoads() {
+  ClearPrechargeFailAuxOutputs();
+  DigIo::inv_out.Clear();
+}
+
 static void Ms10Task(void) {
   static uint32_t vehicleStartTime = 0;
 
@@ -709,7 +730,10 @@ static void Ms10Task(void) {
     IOMatrix::GetPinOut(IOMatrix::HVACTIVE)->Clear();
     dcswDelay = DCSW_DELAY;
     dcswCommanded = false;
+    hvactiveDelay = HVACTIVE_DELAY;
+    hvactiveCommanded = false;
     coolantPumpDelay = COOLANT_PUMP_DELAY;
+    prechargeFailNegDelay = PRECHARGE_FAIL_NEG_DELAY;
     Param::SetInt(
         Param::dir,
         0); // shift to park/neutral on shutdown regardless of shifter pos
@@ -778,10 +802,11 @@ static void Ms10Task(void) {
     if (!prechargeValid || !prechargeRequestActive) {
       dcswDelay = DCSW_DELAY;
       dcswCommanded = false;
+      hvactiveDelay = HVACTIVE_DELAY;
+      hvactiveCommanded = false;
       coolantPumpDelay = COOLANT_PUMP_DELAY;
+      ClearPrechargeFailAuxOutputs();
       DigIo::dcsw_out.Clear();
-      IOMatrix::GetPinOut(IOMatrix::HVACTIVE)->Clear();
-      IOMatrix::GetPinOut(IOMatrix::COOLANTPUMP)->Clear();
     } else if (!dcswCommanded) {
       DigIo::dcsw_out.Clear();
       IOMatrix::GetPinOut(IOMatrix::HVACTIVE)->Clear();
@@ -792,11 +817,26 @@ static void Ms10Task(void) {
 
       if (dcswDelay == 0) {
         DigIo::dcsw_out.Set();
-        IOMatrix::GetPinOut(IOMatrix::HVACTIVE)->Set();
         dcswCommanded = true;
+        hvactiveDelay = HVACTIVE_DELAY;
+      }
+    } else if (!hvactiveCommanded) {
+      DigIo::dcsw_out.Set();
+      IOMatrix::GetPinOut(IOMatrix::HVACTIVE)->Clear();
+      IOMatrix::GetPinOut(IOMatrix::COOLANTPUMP)->Clear();
+
+      if (hvactiveDelay != 0)
+        hvactiveDelay--; // DCSW must be on for 10 ms before HVACTIVE.
+
+      if (hvactiveDelay == 0) {
+        IOMatrix::GetPinOut(IOMatrix::HVACTIVE)->Set();
+        hvactiveCommanded = true;
         coolantPumpDelay = COOLANT_PUMP_DELAY;
       }
     } else {
+      DigIo::dcsw_out.Set();
+      IOMatrix::GetPinOut(IOMatrix::HVACTIVE)->Set();
+
       if (coolantPumpDelay != 0)
         coolantPumpDelay--;
 
@@ -826,31 +866,43 @@ static void Ms10Task(void) {
 
     if (udc < (Param::GetInt(Param::udcsw)) &&
         rtc_get_counter_val() > (vehicleStartTime + PRECHARGE_TIMEOUT)) {
+      ClearPrechargeFailLoads();
+      DigIo::dcsw_out.Clear();
       DigIo::prec_out.Clear();
+      prechargeFailNegDelay = PRECHARGE_FAIL_NEG_DELAY;
       ErrorMessage::Post(ERR_PRECHARGE);
       opmode = MOD_PCHFAIL;
     }
     Param::SetInt(Param::opmode, opmode);
     break;
 
-  case MOD_PCHFAIL:
+  case MOD_PCHFAIL: {
     StartSig = false;
-    IOMatrix::GetPinOut(IOMatrix::COOLANTPUMP)->Clear();
-    IOMatrix::GetPinOut(IOMatrix::HVACTIVE)->Clear();
+    ClearPrechargeFailLoads();
     dcswDelay = DCSW_DELAY;
     dcswCommanded = false;
+    hvactiveDelay = HVACTIVE_DELAY;
+    hvactiveCommanded = false;
     coolantPumpDelay = COOLANT_PUMP_DELAY;
     DigIo::dcsw_out.Clear();
-    DigIo::prec_out
-        .Clear(); // explicitly turn off precharge relay in a fail condition
-    if (initbyCharge && !chargeMode)
-      opmode = MOD_OFF; // only go to off if the signal from charge or vehicle
-                        // start is removed
-    if (initbyStart && !selectedVehicle->Ready())
-      opmode = MOD_OFF; // this avoids oscillation in the event of a precharge
-                        // system failure
+    DigIo::prec_out.Clear();
+
+    if (prechargeFailNegDelay != 0)
+      prechargeFailNegDelay--;
+
+    if (prechargeFailNegDelay == 0)
+      IOMatrix::GetPinOut(IOMatrix::NEGCONTACTOR)->Clear();
+
+    bool prechargeFailRequestReleased =
+        (initbyCharge && !chargeMode) ||
+        (initbyStart && !selectedVehicle->Ready()) ||
+        (preheater.GetInitByPreHeat() && !preheater.GetRunPreHeat());
+
+    if (prechargeFailNegDelay == 0 && prechargeFailRequestReleased)
+      opmode = MOD_OFF;
     Param::SetInt(Param::opmode, opmode);
     break;
+  }
 
   case MOD_CHARGE:
     ErrorMessage::UnpostAll();
