@@ -785,11 +785,14 @@ static void Ms10Task(void) {
       if (selectedInverter != &openInv)
         DigIo::inv_out.Set(); // inverter power on but not if we are in charge
                               // mode and not if OI
-    } else if ((Param::GetInt(Param::ShuntType) == 0) &&
-               selectedInverter == &leafInv) // Shunt 0 + Leaf is precharge
-                                             // using leaf inverter voltage
-    {
-      DigIo::inv_out.Set(); // inverter power on
+    } else if (((Param::GetInt(Param::ShuntType) == 0) &&
+                selectedInverter == &leafInv) ||
+               ((Param::GetInt(Param::ShuntType) == 1 ||
+                 Param::GetInt(Param::ShuntType) == 4) &&
+                selectedInverter != &openInv)) {
+      // Keep IGN on while charging when an ISA shunt is selected, except when
+      // OpenInverter is selected. Shunt 0 + Leaf still uses inverter voltage.
+      DigIo::inv_out.Set();
     }
     IOMatrix::GetPinOut(IOMatrix::NEGCONTACTOR)->Set();
     if (rlyDly != 0)
