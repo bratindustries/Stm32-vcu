@@ -111,6 +111,7 @@
 #include <stdint.h>
 
 #define PRECHARGE_TIMEOUT 5 // 5s
+#define PP_UNPLUG_CONFIRM_TICKS 5 // 5 x 200ms = 1s confirmed unplug
 
 #define PRINT_JSON 0
 
@@ -123,6 +124,9 @@ static Stm32Scheduler *scheduler;
 static bool chargeMode = false;
 static bool chargeModeDC = false;
 static bool ChgLck = false;
+static bool acSessionActive = false;
+static bool ppUnplugConfirmed = false;
+static uint8_t ppUnplugTicks = 0;
 static CanHardware *canInterface[3];
 static CanMap *canMap;
 static CanSdo *canSdo;
@@ -289,18 +293,60 @@ static void Ms200Task(void) {
     int ppValue = IOMatrix::GetAnaloguePin(IOMatrix::PILOT_PROX)->Get();
     Param::SetInt(Param::PPVal, ppValue);
 
-    // If PP is at or below threshold and currently disabled and not already
-    // finished
+    // Re-arm a completed AC session only after PP has continuously reported
+    // unplugged, followed by a new plug-in. This prevents a PP transient while
+    // the EVSE or OBC is shutting down from clearing the completion latch.
     if (ppValue <= ppThresh) {
+      if (ChgLck && ppUnplugConfirmed) {
+        ChgLck = false;
+        acSessionActive = false;
+      }
+      ppUnplugTicks = 0;
+      ppUnplugConfirmed = false;
+
       if (ChgSet == 1 && !ChgLck) {
         RunACChg = true;
       }
       Param::SetInt(Param::PlugDet, 1);
     } else if (ppValue > ppThresh) {
-      // even if timer was enabled, change to disabled, we've unplugged
+      // Stop immediately on a possible unplug, but do not clear ChgLck until
+      // the unplug has been confirmed and a subsequent plug-in is observed.
       RunACChg = false;
-      ChgLck = false; // physical unplug permits the next AC charge session
       Param::SetInt(Param::PlugDet, 0);
+
+      if (ChgLck) {
+        if (ppUnplugTicks < PP_UNPLUG_CONFIRM_TICKS)
+          ppUnplugTicks++;
+        if (ppUnplugTicks >= PP_UNPLUG_CONFIRM_TICKS) {
+          ppUnplugConfirmed = true;
+          acSessionActive = false;
+        }
+      } else {
+        ppUnplugTicks = 0;
+        ppUnplugConfirmed = false;
+        acSessionActive = false;
+      }
+    }
+  }
+
+  ///////////////////////////////////////
+  // Charge termination logic for AC charge
+  ///////////////////////////////////////
+  /*
+  If we are in AC charge mode and battV >= setpoint and current is <= the
+  termination setpoint, end charge and require an unplug before another AC
+  session. The BMS may also terminate AC charging by commanding 0A.
+  */
+  if (opmode == MOD_CHARGE && !chargeModeDC) {
+    if (Param::GetInt(Param::udc) >= Param::GetInt(Param::Voltspnt) &&
+        Param::GetInt(Param::idc) <= Param::GetInt(Param::IdcTerm)) {
+      RunACChg = false;
+      ChgLck = true;
+    }
+
+    if (selectedBMS->MaxChargeCurrent() == 0) {
+      RunACChg = false;
+      ChgLck = true;
     }
   }
 
@@ -313,7 +359,18 @@ static void Ms200Task(void) {
   // Check if we want to AC charge via charger
   bool acChargeRequested =
       selectedCharger->ControlCharge(RunACChg && !ChgLck, ACrequest);
+
+  // Also latch an AC session that the charger or EVSE ends before the generic
+  // voltage/current termination test catches it. With PP configured, a real
+  // unplug is handled above and is not treated as an automatic termination.
+  if (acSessionActive && !acChargeRequested && opmode != MOD_RUN &&
+      (!proxPilotConfigured || Param::GetBool(Param::PlugDet))) {
+    RunACChg = false;
+    ChgLck = true;
+  }
+
   if (!ChgLck && acChargeRequested && (opmode != MOD_RUN)) {
+    acSessionActive = true;
     chargeMode = true; // AC charge mode
     Param::SetInt(Param::chgtyp, AC);
   } else if (!chargeModeDC) {
@@ -322,34 +379,13 @@ static void Ms200Task(void) {
   }
   // end check
 
-  ///////////////////////////////////////
-  // Charge term logic for AC charge
-  ///////////////////////////////////////
-  /*
-  if we are in charge mode and battV >= setpoint and power is <= termination
-  setpoint Then we end charge.
-  */
-  if (opmode == MOD_CHARGE && !chargeModeDC) {
-    if (Param::GetInt(Param::udc) >= Param::GetInt(Param::Voltspnt) &&
-        Param::GetInt(Param::idc) <= Param::GetInt(Param::IdcTerm)) {
-      RunACChg = false; // end AC charge without changing DC permission
-      ChgLck = true;    // inhibit another AC session until physical unplug
-    }
-
-    if (selectedBMS->MaxChargeCurrent() ==
-        0) // BMS can command an AC charge shutdown if its current limit is 0
-    {
-      RunACChg = false; // end AC charge without changing DC permission
-      ChgLck = true;    // inhibit another AC session until physical unplug
-    }
-  }
-  // End Charge Term Logic
-
   if (opmode == MOD_RUN) {
     // Preserve the legacy reset for installations without proximity pilot.
     // With PP configured, only a confirmed physical unplug clears ChgLck.
-    if (!proxPilotConfigured)
+    if (!proxPilotConfigured) {
       ChgLck = false;
+      acSessionActive = false;
+    }
 
     // Brake Vac Sensor
     if (Param::GetInt(Param::GPA1Func) == IOMatrix::VAC_SENSOR ||
