@@ -3,8 +3,6 @@
  *
  * Copyright (C) 2018 Johannes Huebner <dev@johanneshuebner.com>
  *
- * changes by Angus Johnson 2026 <info@bratindustries.net>
- *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
  * the Free Software Foundation, either version 3 of the License, or
@@ -110,24 +108,6 @@ void FCChademo::Task100Ms() // sends chademo messages every 100ms
   uint32_t data[2];
   bool curSensFault = curTimeout > 10;
   bool vtgSensFault = vtgTimeout > 50;
-
-  float udc2 = Param::GetFloat(Param::udc2);
-  data[0] = udc2;
-  data[1] = 0;
-
-  txMessage.frame.idType = dSTANDARD_CAN_MSG_ID_2_0B;
-  txMessage.frame.id = 0x103;
-  txMessage.frame.dlc = 8;
-  txMessage.frame.data0 = (data[0] & 0xFF);
-  txMessage.frame.data1 = (data[0] >> 8 & 0xFF);
-  txMessage.frame.data2 = (data[0] >> 16 & 0xFF);
-  txMessage.frame.data3 = (data[0] >> 24 & 0xFF);
-  txMessage.frame.data4 = (data[1] & 0xFF);
-  txMessage.frame.data5 = (data[1] >> 8 & 0xFF);
-  txMessage.frame.data6 = (data[1] >> 16 & 0xFF);
-  txMessage.frame.data7 = (data[1] >> 24 & 0xFF);
-  CANSPI_Transmit(&txMessage);
-  delay();
 
   // Capacity fixed to 200 - so SoC resolution is 0.5
   data[0] = 0;
@@ -298,11 +278,15 @@ bool FCChademo::DCFCRequest(bool RunDCChg) {
     dcfcVoltageMatchTicks = 0;
     controlledCurrent = 0;
     chargeMode = false;
+bool FCChademo::DCFCRequest(bool RunCh) {
+  if ((RunCh) && (IOMatrix::GetPinIn(IOMatrix::DCFCREQUEST)->Get())) {
+    return true;
+  } else {
     FCChademo::SetChargeCurrent(0);
     FCChademo::SetEnabled(false);
     IOMatrix::GetPinOut(IOMatrix::CHADEMOALLOW)
         ->Clear(); // FCChademo charge allow off
     chademoStartTime = 0;
+    return false;
   }
-  return false;
 }
