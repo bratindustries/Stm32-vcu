@@ -36,6 +36,13 @@ uint8_t FCChademo::soc;
 uint32_t FCChademo::vtgTimeout = 0;
 uint32_t FCChademo::curTimeout = 0;
 static uint32_t chademoStartTime = 0;
+static bool dcfcSessionActive = false;
+static uint8_t dcfcDropoutTicks = 0;
+static const uint8_t DCFC_DROPOUT_LIMIT = 6; // 6 x 100ms = ~600ms
+static int32_t controlledCurrent = 0;
+static uint8_t dcfcVoltageMatchTicks = 0;
+static const uint8_t DCFC_VOLTAGE_MATCH_TICKS = 3;
+static const uint16_t DCFC_VOLTAGE_MATCH_TOLERANCE = 10; // volts
 
 uCAN_MSG txMessage;
 
@@ -160,7 +167,6 @@ void FCChademo::Task100Ms() // sends chademo messages every 100ms
 
 void FCChademo::Task200Ms() {
   // formally the runchademo routine.
-  static int32_t controlledCurrent = 0;
   if (chademoStartTime == 0) // && Param::GetInt(Param::opmode) != MOD_CHARGE)
   {
     chademoStartTime = rtc_get_counter_val();
@@ -181,6 +187,7 @@ void FCChademo::Task200Ms() {
 
   if (chargeMode) {
     int udc = Param::GetInt(Param::udc);
+    int ccsV = FCChademo::GetChargerOutputVoltage();
     int udcspnt = Param::GetInt(Param::Voltspnt);
     int chargeLim = Param::GetInt(Param::CCS_ILim);
     chargeLim = MIN(150, chargeLim);
@@ -190,16 +197,34 @@ void FCChademo::Task200Ms() {
     // Note: No need to worry about bms type as if none selected sets to 999.
     // If chargeLim==0 chademo session will end.
 
-    if (udc < udcspnt && controlledCurrent <= chargeLim)
-      controlledCurrent++;
-    if (udc > udcspnt && controlledCurrent > 0)
-      controlledCurrent--;
-    if (controlledCurrent > chargeLim)
-      controlledCurrent--;
+    // The charger-side voltage only matches UDC after CHAdeMO pin 10 has
+    // closed the dedicated charge contactors. Keep the current request at zero
+    // until the voltages have matched for three consecutive 200 ms checks.
+    if (ccsV > 50 && ABS(udc - ccsV) <= DCFC_VOLTAGE_MATCH_TOLERANCE) {
+      if (dcfcVoltageMatchTicks < DCFC_VOLTAGE_MATCH_TICKS)
+        dcfcVoltageMatchTicks++;
+    } else {
+      dcfcVoltageMatchTicks = 0;
+    }
+
+    if (dcfcVoltageMatchTicks >= DCFC_VOLTAGE_MATCH_TICKS) {
+      if (udc < udcspnt && controlledCurrent <= chargeLim)
+        controlledCurrent++;
+      if (udc > udcspnt && controlledCurrent > 0)
+        controlledCurrent--;
+      if (controlledCurrent > chargeLim)
+        controlledCurrent--;
+    } else {
+      controlledCurrent = 0;
+    }
 
     FCChademo::SetChargeCurrent(controlledCurrent);
     // TODO: fix this to not false trigger
     // FCChademo::CheckSensorDeviation(Param::GetInt(Param::udc));
+  } else {
+    controlledCurrent = 0;
+    dcfcVoltageMatchTicks = 0;
+    FCChademo::SetChargeCurrent(0);
   }
 
   FCChademo::SetTargetBatteryVoltage(Param::GetInt(Param::Voltspnt) + 10);
@@ -207,6 +232,8 @@ void FCChademo::Task200Ms() {
   Param::SetInt(Param::CCS_Ireq, FCChademo::GetRampedCurrentRequest());
 
   if (Param::GetInt(Param::CCS_ILim) == 0) {
+    controlledCurrent = 0;
+    dcfcVoltageMatchTicks = 0;
     FCChademo::SetChargeCurrent(0);
     FCChademo::SetEnabled(false);
     IOMatrix::GetPinOut(IOMatrix::CHADEMOALLOW)
@@ -221,6 +248,36 @@ void FCChademo::Task200Ms() {
   Param::SetInt(Param::CCS_V_Avail, FCChademo::GetChargerMaxVoltage());
 }
 
+bool FCChademo::DCFCRequest(bool RunDCChg) {
+  bool request = IOMatrix::GetPinIn(IOMatrix::DCFCREQUEST)->Get();
+
+  // A real high is always required to start a new CHAdeMO session.
+  if (RunDCChg && request) {
+    dcfcSessionActive = true;
+    dcfcDropoutTicks = 0;
+    return true;
+  }
+
+  // Once a session is active, tolerate a short station control-signal dropout.
+  // DCFCRequest() is evaluated from the 100ms task, so 6 ticks is ~600ms.
+  // Only tolerate control-signal dropouts after the CHAdeMO session
+  // has started and the CHAdeMO task has begun running.
+  if (RunDCChg && dcfcSessionActive && chademoStartTime != 0 &&
+      dcfcDropoutTicks < DCFC_DROPOUT_LIMIT) {
+    dcfcDropoutTicks++;
+    return true;
+  }
+
+  // Persistent loss of the hardwired request, or DC charge permission being
+  // removed, ends the session.
+  // Guarded by dcfcSessionActive to prevent continuously spamming shutdown commands
+  // over CAN/GPIOs while the vehicle is idle.
+  if (dcfcSessionActive) {
+    dcfcSessionActive = false;
+    dcfcDropoutTicks = 0;
+    dcfcVoltageMatchTicks = 0;
+    controlledCurrent = 0;
+    chargeMode = false;
 bool FCChademo::DCFCRequest(bool RunCh) {
   if ((RunCh) && (IOMatrix::GetPinIn(IOMatrix::DCFCREQUEST)->Get())) {
     return true;
