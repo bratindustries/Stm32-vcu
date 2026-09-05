@@ -6,6 +6,7 @@
  * Copyright (C) 2010 Edward Cheeseman <cheesemanedward@gmail.com>
  * Copyright (C) 2009 Uwe Hermann <uwe@hermann-uwe.de>
  * Copyright (C) 2019-2022 Damien Maguire <info@evbmw.com>
+ * Changes by Angus Johnson 2026 <info@bratindustries.net>
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -110,7 +111,6 @@
 #include <stdint.h>
 
 #define PRECHARGE_TIMEOUT 5 // 5s
-#define PP_UNPLUG_CONFIRM_TICKS 5 // 5 x 200ms = 1s confirmed unplug
 
 #define PRINT_JSON 0
 
@@ -123,9 +123,6 @@ static Stm32Scheduler *scheduler;
 static bool chargeMode = false;
 static bool chargeModeDC = false;
 static bool ChgLck = false;
-static bool acSessionActive = false;
-static bool ppUnplugConfirmed = false;
-static uint8_t ppUnplugTicks = 0;
 static CanHardware *canInterface[3];
 static CanMap *canMap;
 static CanSdo *canSdo;
@@ -133,9 +130,7 @@ static ChargeModes targetCharger;
 static ChargeInterfaces targetChgint;
 static uint8_t ChgSet; // Temp variable storing Param::Chgctrl. 0=enable,
                        // 1=disable, 2=timer.
-static bool RunACChg = false;
-static bool RunDCChg = true; // DC charging is controlled by its interface,
-                             // not by Chgctrl.
+static bool RunChg;
 static uint8_t ChgHrs_tmp;
 static uint8_t ChgMins_tmp;
 static uint16_t ChgDur_tmp;
@@ -226,9 +221,6 @@ static Preheater preheater;
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 static void Ms200Task(void) {
   int opmode = Param::GetInt(Param::opmode);
-  const bool proxPilotConfigured =
-      Param::GetInt(Param::GPA1Func) == IOMatrix::PILOT_PROX ||
-      Param::GetInt(Param::GPA2Func) == IOMatrix::PILOT_PROX;
 
   selectedVehicle->Task200Ms();
   if (opmode == MOD_CHARGE)
@@ -257,7 +249,7 @@ static void Ms200Task(void) {
   Param::SetInt(Param::uptime, rtc_get_counter_val());
   Param::SetInt(Param::ChgT, ChgDur_tmp);
 
-  // Set the main AC and DC charge permissions.
+  // Setting of RunChg - main okay to charge param
 
   if (ChgSet == 2 && !ChgLck) // if in timer mode and not locked out from a
                               // previous full charge.
@@ -265,20 +257,20 @@ static void Ms200Task(void) {
     if (opmode != MOD_CHARGE) {
       if ((ChgHrs_tmp == hours) && (ChgMins_tmp == minutes) &&
           (ChgDur_tmp != 0))
-        RunACChg = true; // if we arrive at set charge time and duration is
-                         // non-zero, allow AC charging
+        RunChg = true; // if we arrive at set charge time and duration is non
+                       // zero then initiate charge
       else
-        RunACChg = false;
+        RunChg = false;
     }
 
-    if (opmode == MOD_CHARGE && !chargeModeDC) {
+    if (opmode == MOD_CHARGE) {
       if (ChgTicks != 0) {
         ChgTicks--; // decrement charge timer ticks
         ChgTicks_1Min++;
       }
 
       if (ChgTicks == 0) {
-        RunACChg = false; // end AC charge if still charging when timer expires
+        RunChg = false; // end charge if still charging once timer expires.
         ChgTicks = (GetInt(Param::Chg_Dur) * 300); // recharge the tick timer
       }
 
@@ -289,95 +281,36 @@ static void Ms200Task(void) {
     }
   }
   if (ChgSet == 0 && !ChgLck)
-    RunACChg = true; // enable AC charging from webui if we are not locked out
-                     // from an automatic termination
+    RunChg = true; // enable from webui if we are not locked out from an auto
+                   // termination
   if (ChgSet == 1)
-    RunACChg = false; // disable AC charging from webui
+    RunChg = false; // disable from webui
 
-  // Handle PP on the charging port. Proximity pilot only controls AC charging.
-  if (proxPilotConfigured) {
+  // Handle PP on the Charging port - Changes RunChg
+  if (Param::GetInt(Param::GPA1Func) == IOMatrix::PILOT_PROX ||
+      Param::GetInt(Param::GPA2Func) == IOMatrix::PILOT_PROX) {
     int ppThresh = Param::GetInt(Param::ppthresh);
     int ppValue = IOMatrix::GetAnaloguePin(IOMatrix::PILOT_PROX)->Get();
     Param::SetInt(Param::PPVal, ppValue);
 
-    // Re-arm a completed AC session only after PP has continuously reported
-    // unplugged, followed by a new plug-in. This prevents a PP transient while
-    // the EVSE or OBC is shutting down from clearing the completion latch.
+    // If PP is at or below threshold and currently disabled and not already
+    // finished
     if (ppValue <= ppThresh) {
-      if (ChgLck && ppUnplugConfirmed) {
-        ChgLck = false;
-        acSessionActive = false;
-      }
-      ppUnplugTicks = 0;
-      ppUnplugConfirmed = false;
-
       if (ChgSet == 1 && !ChgLck) {
-        RunACChg = true;
+        RunChg = true;
       }
       Param::SetInt(Param::PlugDet, 1);
     } else if (ppValue > ppThresh) {
-      // Stop immediately on a possible unplug, but do not clear ChgLck until
-      // the unplug has been confirmed and a subsequent plug-in is observed.
-      RunACChg = false;
+      // even if timer was enabled, change to disabled, we've unplugged
+      RunChg = false;
       Param::SetInt(Param::PlugDet, 0);
-
-      if (ChgLck) {
-        if (ppUnplugTicks < PP_UNPLUG_CONFIRM_TICKS)
-          ppUnplugTicks++;
-        if (ppUnplugTicks >= PP_UNPLUG_CONFIRM_TICKS) {
-          ppUnplugConfirmed = true;
-          acSessionActive = false;
-        }
-      } else {
-        ppUnplugTicks = 0;
-        ppUnplugConfirmed = false;
-        acSessionActive = false;
-      }
     }
   }
-
-  ///////////////////////////////////////
-  // Charge termination logic for AC charge
-  ///////////////////////////////////////
-  /*
-  If we are in AC charge mode and battV >= setpoint and current is <= the
-  termination setpoint, end charge and require an unplug before another AC
-  session. The BMS may also terminate AC charging by commanding 0A.
-  */
-  if (opmode == MOD_CHARGE && !chargeModeDC) {
-    if (Param::GetInt(Param::udc) >= Param::GetInt(Param::Voltspnt) &&
-        Param::GetInt(Param::idc) <= Param::GetInt(Param::IdcTerm)) {
-      RunACChg = false;
-      ChgLck = true;
-    }
-
-    if (selectedBMS->MaxChargeCurrent() == 0) {
-      RunACChg = false;
-      ChgLck = true;
-    }
-  }
-
-  // A completed AC charge remains inhibited while the cable is connected.
-  if (ChgLck)
-    RunACChg = false;
-
-  // END setting of AC and DC charge permissions
+  // END Setting of RunChg - main okay to charge param
 
   // Check if we want to AC charge via charger
-  bool acChargeRequested =
-      selectedCharger->ControlCharge(RunACChg && !ChgLck, ACrequest);
-
-  // Also latch an AC session that the charger or EVSE ends before the generic
-  // voltage/current termination test catches it. With PP configured, a real
-  // unplug is handled above and is not treated as an automatic termination.
-  if (acSessionActive && !acChargeRequested && opmode != MOD_RUN &&
-      (!proxPilotConfigured || Param::GetBool(Param::PlugDet))) {
-    RunACChg = false;
-    ChgLck = true;
-  }
-
-  if (!ChgLck && acChargeRequested && (opmode != MOD_RUN)) {
-    acSessionActive = true;
+  if (selectedCharger->ControlCharge(RunChg, ACrequest) &&
+      (opmode != MOD_RUN)) {
     chargeMode = true; // AC charge mode
     Param::SetInt(Param::chgtyp, AC);
   } else if (!chargeModeDC) {
@@ -386,13 +319,31 @@ static void Ms200Task(void) {
   }
   // end check
 
-  if (opmode == MOD_RUN) {
-    // Preserve the legacy reset for installations without proximity pilot.
-    // With PP configured, only a confirmed physical unplug clears ChgLck.
-    if (!proxPilotConfigured) {
-      ChgLck = false;
-      acSessionActive = false;
+  ///////////////////////////////////////
+  // Charge term logic for AC charge
+  ///////////////////////////////////////
+  /*
+  if we are in charge mode and battV >= setpoint and power is <= termination
+  setpoint Then we end charge.
+  */
+  if (opmode == MOD_CHARGE && !chargeModeDC) {
+    if (Param::GetInt(Param::udc) >= Param::GetInt(Param::Voltspnt) &&
+        Param::GetInt(Param::idc) <= Param::GetInt(Param::IdcTerm)) {
+      RunChg = false; // end charge
+      ChgLck = true;  // set charge lockout flag
     }
+
+    if (selectedBMS->MaxChargeCurrent() ==
+        0) // BMS can command an AC charge shutdown if its current limit is 0
+    {
+      RunChg = false; // end charge
+      ChgLck = true;  // set charge lockout flag
+    }
+  }
+  // End Charge Term Logic
+
+  if (opmode == MOD_RUN) {
+    ChgLck = false; // reset charge lockout flag when we drive off
 
     // Brake Vac Sensor
     if (Param::GetInt(Param::GPA1Func) == IOMatrix::VAC_SENSOR ||
@@ -508,9 +459,9 @@ static void Ms100Task(void) {
         ->Task100Ms(); // send the 100ms task request for the lim all the time
                        // and for others if in DC charge mode
 
-  if (selectedChargeInt->DCFCRequest(RunDCChg) ||
-      (RunDCChg && ExtHVreq)) // Request to run dc fast charge via charge
-                              // interface or permitted external pin IO
+  if (selectedChargeInt->DCFCRequest(RunChg) ||
+      ExtHVreq) // Request to run dc fast charge via charge interface or
+                // external pin io
   {
     // Here we receive a valid DCFC startup request.
     if (opmode != MOD_RUN)
@@ -525,7 +476,8 @@ static void Ms100Task(void) {
   if (!chargeModeDC) // Request to run ac charge from the interface (e.g. LIM)
                      // if we are NOT in DC charge mode.
   {
-    ACrequest = selectedChargeInt->ACRequest(RunACChg);
+    ACrequest = selectedChargeInt->ACRequest(
+        RunChg); // If using unused always returns true
   }
   // End charge interface logic
 
@@ -843,7 +795,6 @@ static void Ms10Task(void) {
       DigIo::inv_out.Set();
     }
     IOMatrix::GetPinOut(IOMatrix::NEGCONTACTOR)->Set();
-    IOMatrix::GetPinOut(IOMatrix::COOLANTPUMP)->Set();
     if (rlyDly != 0)
       rlyDly--; // here we are going to pause before energising precharge to
                 // prevent too many contactors pulling amps at the same time
@@ -952,25 +903,11 @@ static void Ms10Task(void) {
 
     if (prechargeFailNegDelay == 0 && prechargeFailRequestReleased)
       opmode = MOD_OFF;
-    DigIo::prec_out
-        .Clear(); // explicitly turn off precharge relay in a fail condition
-    if (initbyCharge && !chargeMode)
-      opmode = MOD_OFF; // only go to off if the signal from charge or vehicle
-                        // start is removed
-    if (initbyStart && !selectedVehicle->Ready())
-      opmode = MOD_OFF; // this avoids oscillation in the event of a precharge
-                        // system failure
     Param::SetInt(Param::opmode, opmode);
     break;
   }
 
   case MOD_CHARGE:
-    if (rlyDly != 0)
-      rlyDly--; // here we are going to pause before energising precharge to
-                // prevent too many contactors pulling amps at the same time
-    if (rlyDly == 0) {
-      DigIo::dcsw_out.Set();
-    }
     ErrorMessage::UnpostAll();
     if (!chargeMode) {
       opmode = MOD_OFF;
@@ -981,13 +918,6 @@ static void Ms10Task(void) {
 
   case MOD_RUN:
     DigIo::inv_out.Set(); // inverter power on
-    if (rlyDly != 0)
-      rlyDly--; // here we are going to pause before energising precharge to
-                // prevent too many contactors pulling amps at the same time
-    if (rlyDly == 0) {
-      DigIo::dcsw_out.Set();
-      DigIo::inv_out.Set(); // inverter power on
-    }
     Param::SetInt(Param::opmode, MOD_RUN);
     ErrorMessage::UnpostAll();
     if (!selectedVehicle->Ready()) {
@@ -998,13 +928,6 @@ static void Ms10Task(void) {
     break;
 
   case MOD_PREHEAT:
-    if (rlyDly != 0)
-      rlyDly--; // here we are going to pause before energising precharge to
-                // prevent too many contactors pulling amps at the same time
-    if (rlyDly == 0) {
-      DigIo::dcsw_out.Set();
-    }
-
     preheater.Ms10Task();
 
     if (!preheater.GetRunPreHeat()) {
@@ -1522,8 +1445,9 @@ int main(void) {
   DigIo::inv_out.Clear(); // inverter power off during bootup
   DigIo::mcp_sby.Clear(); // enable can3
 
-  DigIo::CANEN.Set(); // enable can1 on V1.3 HW
+  DigIo::CANEN.Set();//enable can1 on V1.3 HW
   DigIo::CANSBY.Set();
+
 
   Terminal t(USART3, TermCmds, false, true, !Param::GetBool(Param::UseRS232));
   //   FunctionPointerCallback canCb(CanCallback, SetCanFilters);
