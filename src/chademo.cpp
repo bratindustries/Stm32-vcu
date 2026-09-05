@@ -41,6 +41,10 @@ static uint32_t chademoStartTime = 0;
 static bool dcfcSessionActive = false;
 static uint8_t dcfcDropoutTicks = 0;
 static const uint8_t DCFC_DROPOUT_LIMIT = 6; // 6 x 100ms = ~600ms
+static int32_t controlledCurrent = 0;
+static uint8_t dcfcVoltageMatchTicks = 0;
+static const uint8_t DCFC_VOLTAGE_MATCH_TICKS = 3;
+static const uint16_t DCFC_VOLTAGE_MATCH_TOLERANCE = 10; // volts
 
 uCAN_MSG txMessage;
 
@@ -183,7 +187,6 @@ void FCChademo::Task100Ms() // sends chademo messages every 100ms
 
 void FCChademo::Task200Ms() {
   // formally the runchademo routine.
-  static int32_t controlledCurrent = 0;
   if (chademoStartTime == 0) // && Param::GetInt(Param::opmode) != MOD_CHARGE)
   {
     chademoStartTime = rtc_get_counter_val();
@@ -204,6 +207,7 @@ void FCChademo::Task200Ms() {
 
   if (chargeMode) {
     int udc = Param::GetInt(Param::udc);
+    int ccsV = FCChademo::GetChargerOutputVoltage();
     int udcspnt = Param::GetInt(Param::Voltspnt);
     int chargeLim = Param::GetInt(Param::CCS_ILim);
     chargeLim = MIN(150, chargeLim);
@@ -213,16 +217,34 @@ void FCChademo::Task200Ms() {
     // Note: No need to worry about bms type as if none selected sets to 999.
     // If chargeLim==0 chademo session will end.
 
-    if (udc < udcspnt && controlledCurrent <= chargeLim)
-      controlledCurrent++;
-    if (udc > udcspnt && controlledCurrent > 0)
-      controlledCurrent--;
-    if (controlledCurrent > chargeLim)
-      controlledCurrent--;
+    // The charger-side voltage only matches UDC after CHAdeMO pin 10 has
+    // closed the dedicated charge contactors. Keep the current request at zero
+    // until the voltages have matched for three consecutive 200 ms checks.
+    if (ccsV > 50 && ABS(udc - ccsV) <= DCFC_VOLTAGE_MATCH_TOLERANCE) {
+      if (dcfcVoltageMatchTicks < DCFC_VOLTAGE_MATCH_TICKS)
+        dcfcVoltageMatchTicks++;
+    } else {
+      dcfcVoltageMatchTicks = 0;
+    }
+
+    if (dcfcVoltageMatchTicks >= DCFC_VOLTAGE_MATCH_TICKS) {
+      if (udc < udcspnt && controlledCurrent <= chargeLim)
+        controlledCurrent++;
+      if (udc > udcspnt && controlledCurrent > 0)
+        controlledCurrent--;
+      if (controlledCurrent > chargeLim)
+        controlledCurrent--;
+    } else {
+      controlledCurrent = 0;
+    }
 
     FCChademo::SetChargeCurrent(controlledCurrent);
     // TODO: fix this to not false trigger
     // FCChademo::CheckSensorDeviation(Param::GetInt(Param::udc));
+  } else {
+    controlledCurrent = 0;
+    dcfcVoltageMatchTicks = 0;
+    FCChademo::SetChargeCurrent(0);
   }
 
   FCChademo::SetTargetBatteryVoltage(Param::GetInt(Param::Voltspnt) + 10);
@@ -230,6 +252,8 @@ void FCChademo::Task200Ms() {
   Param::SetInt(Param::CCS_Ireq, FCChademo::GetRampedCurrentRequest());
 
   if (Param::GetInt(Param::CCS_ILim) == 0) {
+    controlledCurrent = 0;
+    dcfcVoltageMatchTicks = 0;
     FCChademo::SetChargeCurrent(0);
     FCChademo::SetEnabled(false);
     IOMatrix::GetPinOut(IOMatrix::CHADEMOALLOW)
@@ -271,6 +295,9 @@ bool FCChademo::DCFCRequest(bool RunDCChg) {
   if (dcfcSessionActive) {
     dcfcSessionActive = false;
     dcfcDropoutTicks = 0;
+    dcfcVoltageMatchTicks = 0;
+    controlledCurrent = 0;
+    chargeMode = false;
     FCChademo::SetChargeCurrent(0);
     FCChademo::SetEnabled(false);
     IOMatrix::GetPinOut(IOMatrix::CHADEMOALLOW)
