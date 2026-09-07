@@ -41,7 +41,8 @@ class SBOX {
 public:
   static void RegisterCanMessages(CanHardware *can);
   static void DecodeCAN(int id, uint32_t data[2]);
-  static void ControlContactors(int opmode, CanHardware *can);
+  static void ControlContactors(int opmode, bool prechargeComplete,
+                                CanHardware *can);
 
   static int32_t Voltage;
   static int32_t Voltage2;
