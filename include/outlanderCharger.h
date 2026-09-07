@@ -3,6 +3,7 @@
  *
  * Copyright (C) 2021-2023  Johannes Huebner <dev@johanneshuebner.com>
  * 	                        Damien Maguire <info@evbmw.com>
+ * changes by Angus Johnson 2026 <info@bratindustries.net>
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -47,7 +48,7 @@ private:
   int16_t actAmps;
   uint8_t currentRamp;
   bool clearToStart = false, shutDownReq = false, pwmON = false;
-  static uint8_t chgStatus, evseDuty;
+  static uint8_t chgStatus, evseDuty, evseDutyAge;
   static float dcBusV, temp_1, temp_2, ACVolts, DCAmps, ACAmps;
   static float LV_Volts, LV_Amps;
   static uint16_t batteryVolts;
