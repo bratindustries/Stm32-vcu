@@ -5,6 +5,7 @@
  *               2021-2022 Damien Maguire <info@evbmw.com>
  * Yes I'm really writing software now........run.....run away.......
  *               2024-     Tom de Bree <Tom@voltinflux.com>
+ * changes by Angus Johnson 2026 <info@bratindustries.net>
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -68,6 +69,7 @@ void LeafINV::DecodeCAN(int id, uint32_t data[2]) {
             420) // Only populate if no shunt is used and voltage is under 420
     {
       Param::SetFloat(Param::udc, voltage);
+      utils::UdcReceived(utils::MEASUREMENT_LEAF_INVERTER);
     }
 
     int16_t parsed_speed = (bytes[4] << 7) | bytes[5] >> 1;

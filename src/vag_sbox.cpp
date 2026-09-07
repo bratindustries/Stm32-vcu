@@ -5,6 +5,7 @@
  * Copyright (C) 2010 Edward Cheeseman <cheesemanedward@gmail.com>
  * Copyright (C) 2009 Uwe Hermann <uwe@hermann-uwe.de>
  * Copyright (C) 2019-2022 Damien Maguire <info@evbmw.com>
+ * changes by Angus Johnson 2026 <info@bratindustries.net>
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -25,6 +26,7 @@
 */
 
 #include <vag_sbox.h>
+#include "utils.h"
 
 int16_t VWBOX::Amperes;
 int32_t VWBOX::Ah;
@@ -60,9 +62,12 @@ void VWBOX::handle0BB(uint32_t data[2]) // VWBOX Current and voltages
                            : q12; // Step1: Copy , Step2: Paste , Step3: Profit!
   Voltage = ((bytes[5] << 4) | ((bytes[4] >> 4) & 0xF)); // output voltage
   Voltage2 = (((bytes[4] & 0xF) << 8) | (bytes[3]));     // battery voltage
+  utils::IdcReceived(utils::MEASUREMENT_VAG_SBOX);
+  utils::UdcReceived(utils::MEASUREMENT_VAG_SBOX);
 }
 
-void VWBOX::ControlContactors(int opmode, CanHardware *can) {
+void VWBOX::ControlContactors(int opmode, bool prechargeComplete,
+                             CanHardware *can) {
   uint8_t bytes[8];
   Sec1tmr++;
   if (Sec1tmr == 100) {
@@ -88,17 +93,15 @@ void VWBOX::ControlContactors(int opmode, CanHardware *can) {
     break;
   case 2: // Precharge
     bytes[2] = bytes[2] | 0x1;
-    ;                           // Neg on
-    bytes[1] = bytes[1] | 0x10; // Prech on
+    ; // Neg on
+    bytes[1] = bytes[1] |
+               (prechargeComplete ? 0x50 : 0x10); // Main + precharge, or
+                                                   // precharge only
     break;
 
   case 1: // Run
-    bytes[2] = bytes[2] | 0x1;
-    ;                           // Neg on
-    bytes[1] = bytes[1] | 0x50; // main on and prech on
-    break;
-
   case 4: // Charge
+  case 5: // Preheat
     bytes[2] = bytes[2] | 0x1;
     ;                           // Neg on
     bytes[1] = bytes[1] | 0x50; // main on and prech on
