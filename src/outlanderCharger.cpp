@@ -3,6 +3,7 @@
  *
  * Copyright (C) 2021-2023  Johannes Huebner <dev@johanneshuebner.com>
  * 	                        Damien Maguire <info@evbmw.com>
+ * changes by Angus Johnson 2026 <info@bratindustries.net>
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -43,6 +44,21 @@ uint16_t EvseTimer = TIMERRESET; // counts of 100ms before timing out for CP
                                  // Duty
 
 bool outlanderCharger::ControlCharge(bool RunCh, bool ACReq) {
+  bool proxRequest = RunCh && Param::GetBool(Param::PlugDet);
+
+  // Allow PP to start Outlander AC charging even when the selected charge
+  // interface is CHAdeMO. This lets AC and DC charging share one saved
+  // configuration without either request enabling the other mode.
+  if (proxRequest) {
+    clearToStart = !EvseTimeout;
+    return clearToStart;
+  }
+
+  // Removing AC permission or unplugging resets the pilot timeout so a later
+  // AC plug-in may start a new attempt.
+  EvseTimeout = false;
+  EvseTimer = TIMERRESET;
+
   int chgmode = Param::GetInt(Param::interface);
   switch (chgmode) {
   case Unused:
@@ -60,8 +76,6 @@ bool outlanderCharger::ControlCharge(bool RunCh, bool ACReq) {
       }
 
     } else {
-      EvseTimeout = false;    // reset EVSE CP duty timeout
-      EvseTimer = TIMERRESET; // reset EVSE CP duty timer
       clearToStart = false;
       return false;
     }

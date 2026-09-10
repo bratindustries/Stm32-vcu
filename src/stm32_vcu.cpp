@@ -6,6 +6,7 @@
  * Copyright (C) 2010 Edward Cheeseman <cheesemanedward@gmail.com>
  * Copyright (C) 2009 Uwe Hermann <uwe@hermann-uwe.de>
  * Copyright (C) 2019-2022 Damien Maguire <info@evbmw.com>
+ * changes by Angus Johnson 2026 <info@bratindustries.net>
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -129,7 +130,9 @@ static ChargeModes targetCharger;
 static ChargeInterfaces targetChgint;
 static uint8_t ChgSet; // Temp variable storing Param::Chgctrl. 0=enable,
                        // 1=disable, 2=timer.
-static bool RunChg;
+static bool RunACChg = false;
+static bool RunDCChg = true; // DC charging is controlled by its interface,
+                             // not by Chgctrl.
 static uint8_t ChgHrs_tmp;
 static uint8_t ChgMins_tmp;
 static uint16_t ChgDur_tmp;
@@ -238,7 +241,7 @@ static void Ms200Task(void) {
   Param::SetInt(Param::uptime, rtc_get_counter_val());
   Param::SetInt(Param::ChgT, ChgDur_tmp);
 
-  // Setting of RunChg - main okay to charge param
+  // Set independent AC and DC charge permissions.
 
   if (ChgSet == 2 && !ChgLck) // if in timer mode and not locked out from a
                               // previous full charge.
@@ -246,20 +249,20 @@ static void Ms200Task(void) {
     if (opmode != MOD_CHARGE) {
       if ((ChgHrs_tmp == hours) && (ChgMins_tmp == minutes) &&
           (ChgDur_tmp != 0))
-        RunChg = true; // if we arrive at set charge time and duration is non
-                       // zero then initiate charge
+        RunACChg = true; // if we arrive at set charge time and duration is
+                         // non-zero, allow AC charging
       else
-        RunChg = false;
+        RunACChg = false;
     }
 
-    if (opmode == MOD_CHARGE) {
+    if (opmode == MOD_CHARGE && !chargeModeDC) {
       if (ChgTicks != 0) {
         ChgTicks--; // decrement charge timer ticks
         ChgTicks_1Min++;
       }
 
       if (ChgTicks == 0) {
-        RunChg = false; // end charge if still charging once timer expires.
+        RunACChg = false; // end AC charge if still charging when timer expires
         ChgTicks = (GetInt(Param::Chg_Dur) * 300); // recharge the tick timer
       }
 
@@ -270,12 +273,12 @@ static void Ms200Task(void) {
     }
   }
   if (ChgSet == 0 && !ChgLck)
-    RunChg = true; // enable from webui if we are not locked out from an auto
-                   // termination
+    RunACChg = true; // enable AC charging from webui if we are not locked out
+                     // from an automatic termination
   if (ChgSet == 1)
-    RunChg = false; // disable from webui
+    RunACChg = false; // disable AC charging from webui
 
-  // Handle PP on the Charging port - Changes RunChg
+  // Handle PP on the charging port. PP only controls AC charging.
   if (Param::GetInt(Param::GPA1Func) == IOMatrix::PILOT_PROX ||
       Param::GetInt(Param::GPA2Func) == IOMatrix::PILOT_PROX) {
     int ppThresh = Param::GetInt(Param::ppthresh);
@@ -286,19 +289,19 @@ static void Ms200Task(void) {
     // finished
     if (ppValue <= ppThresh) {
       if (ChgSet == 1 && !ChgLck) {
-        RunChg = true;
+        RunACChg = true;
       }
       Param::SetInt(Param::PlugDet, 1);
     } else if (ppValue > ppThresh) {
       // even if timer was enabled, change to disabled, we've unplugged
-      RunChg = false;
+      RunACChg = false;
       Param::SetInt(Param::PlugDet, 0);
     }
   }
-  // END Setting of RunChg - main okay to charge param
+  // END setting of AC and DC charge permissions
 
   // Check if we want to AC charge via charger
-  if (selectedCharger->ControlCharge(RunChg, ACrequest) &&
+  if (selectedCharger->ControlCharge(RunACChg, ACrequest) &&
       (opmode != MOD_RUN)) {
     chargeMode = true; // AC charge mode
     Param::SetInt(Param::chgtyp, AC);
@@ -318,14 +321,14 @@ static void Ms200Task(void) {
   if (opmode == MOD_CHARGE && !chargeModeDC) {
     if (Param::GetInt(Param::udc) >= Param::GetInt(Param::Voltspnt) &&
         Param::GetInt(Param::idc) <= Param::GetInt(Param::IdcTerm)) {
-      RunChg = false; // end charge
+      RunACChg = false; // end AC charge
       ChgLck = true;  // set charge lockout flag
     }
 
     if (selectedBMS->MaxChargeCurrent() ==
         0) // BMS can command an AC charge shutdown if its current limit is 0
     {
-      RunChg = false; // end charge
+      RunACChg = false; // end AC charge
       ChgLck = true;  // set charge lockout flag
     }
   }
@@ -447,9 +450,9 @@ static void Ms100Task(void) {
         ->Task100Ms(); // send the 100ms task request for the lim all the time
                        // and for others if in DC charge mode
 
-  if (selectedChargeInt->DCFCRequest(RunChg) ||
-      ExtHVreq) // Request to run dc fast charge via charge interface or
-                // external pin io
+  if (selectedChargeInt->DCFCRequest(RunDCChg) ||
+      (RunDCChg && ExtHVreq)) // Request DC fast charge via the charge
+                              // interface or permitted external input
   {
     // Here we receive a valid DCFC startup request.
     if (opmode != MOD_RUN)
@@ -464,8 +467,7 @@ static void Ms100Task(void) {
   if (!chargeModeDC) // Request to run ac charge from the interface (e.g. LIM)
                      // if we are NOT in DC charge mode.
   {
-    ACrequest = selectedChargeInt->ACRequest(
-        RunChg); // If using unused always returns true
+    ACrequest = selectedChargeInt->ACRequest(RunACChg);
   }
   // End charge interface logic
 
