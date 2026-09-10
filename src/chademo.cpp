@@ -2,6 +2,7 @@
  * This file is part of the tumanako_vc project.
  *
  * Copyright (C) 2018 Johannes Huebner <dev@johanneshuebner.com>
+ * changes by Angus Johnson 2026 <info@bratindustries.net>
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
