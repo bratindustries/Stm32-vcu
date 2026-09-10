@@ -6,6 +6,7 @@
  * Copyright (C) 2010 Edward Cheeseman <cheesemanedward@gmail.com>
  * Copyright (C) 2009 Uwe Hermann <uwe@hermann-uwe.de>
  * Copyright (C) 2019-2022 Damien Maguire <info@evbmw.com>
+ * changes by Angus Johnson 2026 <info@bratindustries.net>
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -102,6 +103,7 @@
 #include "vehicle.h"
 #include <libopencm3/stm32/can.h>
 #include <libopencm3/stm32/exti.h>
+#include <libopencm3/stm32/f1/bkp.h>
 #include <libopencm3/stm32/iwdg.h>
 #include <libopencm3/stm32/rtc.h>
 #include <libopencm3/stm32/spi.h>
@@ -110,6 +112,17 @@
 #include <stdint.h>
 
 #define PRECHARGE_TIMEOUT 5 // 5s
+#define PP_UNPLUG_CONFIRM_TICKS 5 // 5 x 200ms = 1s confirmed unplug
+
+// Stored in the STM32 backup domain so an AC completion lock survives a CPU
+// reset or short 12V brownout. Each value includes a signature so unrelated or
+// uninitialised backup-register contents are rejected.
+enum PersistentAcSessionState : uint16_t {
+  AC_SESSION_IDLE = 0xAC00,
+  AC_SESSION_ACTIVE = 0xAC01,
+  AC_SESSION_LOCKED_PLUGGED = 0xAC02,
+  AC_SESSION_LOCKED_UNPLUGGED = 0xAC03
+};
 
 #define PRINT_JSON 0
 
@@ -122,6 +135,11 @@ static Stm32Scheduler *scheduler;
 static bool chargeMode = false;
 static bool chargeModeDC = false;
 static bool ChgLck = false;
+static bool acSessionActive = false;
+static bool acChargeStateSeen = false;
+static bool ppUnplugConfirmed = false;
+static uint8_t ppUnplugTicks = 0;
+static PersistentAcSessionState persistentAcSessionState = AC_SESSION_IDLE;
 static CanHardware *canInterface[3];
 static CanMap *canMap;
 static CanSdo *canSdo;
@@ -129,7 +147,9 @@ static ChargeModes targetCharger;
 static ChargeInterfaces targetChgint;
 static uint8_t ChgSet; // Temp variable storing Param::Chgctrl. 0=enable,
                        // 1=disable, 2=timer.
-static bool RunChg;
+static bool RunACChg = false;
+static bool RunDCChg = true; // DC charging is controlled by its interface,
+                             // not by Chgctrl.
 static uint8_t ChgHrs_tmp;
 static uint8_t ChgMins_tmp;
 static uint16_t ChgDur_tmp;
@@ -207,9 +227,74 @@ static RearOutlanderInverter rearoutlanderInv;
 static LinBus *lin;
 static Preheater preheater;
 
+static PersistentAcSessionState ReadPersistentAcSessionState() {
+  switch ((uint16_t)BKP_DR1) {
+  case AC_SESSION_ACTIVE:
+    return AC_SESSION_ACTIVE;
+  case AC_SESSION_LOCKED_PLUGGED:
+    return AC_SESSION_LOCKED_PLUGGED;
+  case AC_SESSION_LOCKED_UNPLUGGED:
+    return AC_SESSION_LOCKED_UNPLUGGED;
+  default:
+    return AC_SESSION_IDLE;
+  }
+}
+
+static void SetPersistentAcSessionState(PersistentAcSessionState state) {
+  if (persistentAcSessionState == state)
+    return;
+
+  // rtc_setup() enables write access to the backup domain. A single register
+  // write is used so a brownout cannot leave a multi-register record halfway
+  // updated.
+  BKP_DR1 = state;
+  persistentAcSessionState = state;
+}
+
+static void RestorePersistentAcSessionState() {
+  const bool proxPilotConfigured =
+      Param::GetInt(Param::GPA1Func) == IOMatrix::PILOT_PROX ||
+      Param::GetInt(Param::GPA2Func) == IOMatrix::PILOT_PROX;
+
+  persistentAcSessionState = ReadPersistentAcSessionState();
+
+  if (!proxPilotConfigured) {
+    // This restart protection can only be re-armed by a physical PP cycle.
+    // Do not retain it on configurations without a proximity-pilot input.
+    SetPersistentAcSessionState(AC_SESSION_IDLE);
+    return;
+  }
+
+  if (persistentAcSessionState != AC_SESSION_IDLE) {
+    ChgLck = true;
+    RunACChg = false;
+
+    // If unplug had already been confirmed before the reset, a fresh plugged
+    // reading represents the required new plug-in and may clear the lock.
+    ppUnplugConfirmed =
+        persistentAcSessionState == AC_SESSION_LOCKED_UNPLUGGED;
+  }
+}
+
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 static void Ms200Task(void) {
   int opmode = Param::GetInt(Param::opmode);
+  const bool proxPilotConfigured =
+      Param::GetInt(Param::GPA1Func) == IOMatrix::PILOT_PROX ||
+      Param::GetInt(Param::GPA2Func) == IOMatrix::PILOT_PROX;
+
+  // Remember that this AC request made it all the way into charge mode. If
+  // another part of the state machine forces it out while the request remains
+  // asserted, latch the completed/aborted session before it can precharge
+  // again.
+  if (acSessionActive && opmode == MOD_CHARGE && !chargeModeDC)
+    acChargeStateSeen = true;
+  if (acChargeStateSeen && opmode != MOD_CHARGE) {
+    RunACChg = false;
+    ChgLck = true;
+    if (proxPilotConfigured)
+      SetPersistentAcSessionState(AC_SESSION_LOCKED_PLUGGED);
+  }
 
   selectedVehicle->Task200Ms();
   if (opmode == MOD_CHARGE)
@@ -238,7 +323,7 @@ static void Ms200Task(void) {
   Param::SetInt(Param::uptime, rtc_get_counter_val());
   Param::SetInt(Param::ChgT, ChgDur_tmp);
 
-  // Setting of RunChg - main okay to charge param
+  // Set independent AC and DC charge permissions.
 
   if (ChgSet == 2 && !ChgLck) // if in timer mode and not locked out from a
                               // previous full charge.
@@ -246,20 +331,20 @@ static void Ms200Task(void) {
     if (opmode != MOD_CHARGE) {
       if ((ChgHrs_tmp == hours) && (ChgMins_tmp == minutes) &&
           (ChgDur_tmp != 0))
-        RunChg = true; // if we arrive at set charge time and duration is non
-                       // zero then initiate charge
+        RunACChg = true; // if we arrive at set charge time and duration is
+                         // non-zero, allow AC charging
       else
-        RunChg = false;
+        RunACChg = false;
     }
 
-    if (opmode == MOD_CHARGE) {
+    if (opmode == MOD_CHARGE && !chargeModeDC) {
       if (ChgTicks != 0) {
         ChgTicks--; // decrement charge timer ticks
         ChgTicks_1Min++;
       }
 
       if (ChgTicks == 0) {
-        RunChg = false; // end charge if still charging once timer expires.
+        RunACChg = false; // end AC charge if still charging when timer expires
         ChgTicks = (GetInt(Param::Chg_Dur) * 300); // recharge the tick timer
       }
 
@@ -270,36 +355,105 @@ static void Ms200Task(void) {
     }
   }
   if (ChgSet == 0 && !ChgLck)
-    RunChg = true; // enable from webui if we are not locked out from an auto
-                   // termination
+    RunACChg = true; // enable AC charging from webui if we are not locked out
+                     // from an automatic termination
   if (ChgSet == 1)
-    RunChg = false; // disable from webui
+    RunACChg = false; // disable AC charging from webui
 
-  // Handle PP on the Charging port - Changes RunChg
-  if (Param::GetInt(Param::GPA1Func) == IOMatrix::PILOT_PROX ||
-      Param::GetInt(Param::GPA2Func) == IOMatrix::PILOT_PROX) {
+  // Handle PP on the charging port. Proximity pilot only controls AC charging.
+  if (proxPilotConfigured) {
     int ppThresh = Param::GetInt(Param::ppthresh);
     int ppValue = IOMatrix::GetAnaloguePin(IOMatrix::PILOT_PROX)->Get();
     Param::SetInt(Param::PPVal, ppValue);
 
-    // If PP is at or below threshold and currently disabled and not already
-    // finished
+    // Re-arm a completed AC session only after PP has continuously reported
+    // unplugged, followed by a new plug-in. This prevents a PP transient while
+    // the EVSE or OBC is shutting down from clearing the completion latch.
     if (ppValue <= ppThresh) {
+      if (ChgLck && ppUnplugConfirmed) {
+        ChgLck = false;
+        acSessionActive = false;
+        acChargeStateSeen = false;
+        SetPersistentAcSessionState(AC_SESSION_IDLE);
+      }
+      ppUnplugTicks = 0;
+      ppUnplugConfirmed = false;
+
       if (ChgSet == 1 && !ChgLck) {
-        RunChg = true;
+        RunACChg = true;
       }
       Param::SetInt(Param::PlugDet, 1);
     } else if (ppValue > ppThresh) {
-      // even if timer was enabled, change to disabled, we've unplugged
-      RunChg = false;
+      // Stop immediately on a possible unplug, but do not clear ChgLck until
+      // the unplug has been confirmed and a subsequent plug-in is observed.
+      RunACChg = false;
       Param::SetInt(Param::PlugDet, 0);
+
+      if (ChgLck) {
+        if (ppUnplugTicks < PP_UNPLUG_CONFIRM_TICKS)
+          ppUnplugTicks++;
+        if (ppUnplugTicks >= PP_UNPLUG_CONFIRM_TICKS) {
+          ppUnplugConfirmed = true;
+          acSessionActive = false;
+          acChargeStateSeen = false;
+          SetPersistentAcSessionState(AC_SESSION_LOCKED_UNPLUGGED);
+        }
+      } else {
+        ppUnplugTicks = 0;
+        ppUnplugConfirmed = false;
+      }
     }
   }
-  // END Setting of RunChg - main okay to charge param
+
+  ///////////////////////////////////////
+  // Charge termination logic for AC charge
+  ///////////////////////////////////////
+  /*
+  If we are in AC charge mode and battV >= setpoint and current is <= the
+  termination setpoint, end charge and require an unplug before another AC
+  session. The BMS may also terminate AC charging by commanding 0A.
+  */
+  if (opmode == MOD_CHARGE && !chargeModeDC) {
+    if (Param::GetInt(Param::udc) >= Param::GetInt(Param::Voltspnt) &&
+        Param::GetInt(Param::idc) <= Param::GetInt(Param::IdcTerm)) {
+      RunACChg = false;
+      ChgLck = true;
+      if (proxPilotConfigured)
+        SetPersistentAcSessionState(AC_SESSION_LOCKED_PLUGGED);
+    }
+
+    if (selectedBMS->MaxChargeCurrent() == 0) {
+      RunACChg = false;
+      ChgLck = true;
+      if (proxPilotConfigured)
+        SetPersistentAcSessionState(AC_SESSION_LOCKED_PLUGGED);
+    }
+  }
+
+  // A completed AC charge remains inhibited while the cable is connected.
+  if (ChgLck)
+    RunACChg = false;
+
+  // END setting of AC and DC charge permissions
 
   // Check if we want to AC charge via charger
-  if (selectedCharger->ControlCharge(RunChg, ACrequest) &&
-      (opmode != MOD_RUN)) {
+  bool acChargeRequested =
+      selectedCharger->ControlCharge(RunACChg && !ChgLck, ACrequest);
+
+  // Also latch an AC session that the charger, EVSE, or PP signal ends before
+  // the generic voltage/current termination test catches it. A real unplug
+  // confirms and re-arms the latch separately; it must not bypass the latch.
+  if (acSessionActive && !acChargeRequested && opmode != MOD_RUN) {
+    RunACChg = false;
+    ChgLck = true;
+    if (proxPilotConfigured)
+      SetPersistentAcSessionState(AC_SESSION_LOCKED_PLUGGED);
+  }
+
+  if (!ChgLck && acChargeRequested && (opmode != MOD_RUN)) {
+    acSessionActive = true;
+    if (proxPilotConfigured)
+      SetPersistentAcSessionState(AC_SESSION_ACTIVE);
     chargeMode = true; // AC charge mode
     Param::SetInt(Param::chgtyp, AC);
   } else if (!chargeModeDC) {
@@ -308,31 +462,15 @@ static void Ms200Task(void) {
   }
   // end check
 
-  ///////////////////////////////////////
-  // Charge term logic for AC charge
-  ///////////////////////////////////////
-  /*
-  if we are in charge mode and battV >= setpoint and power is <= termination
-  setpoint Then we end charge.
-  */
-  if (opmode == MOD_CHARGE && !chargeModeDC) {
-    if (Param::GetInt(Param::udc) >= Param::GetInt(Param::Voltspnt) &&
-        Param::GetInt(Param::idc) <= Param::GetInt(Param::IdcTerm)) {
-      RunChg = false; // end charge
-      ChgLck = true;  // set charge lockout flag
-    }
-
-    if (selectedBMS->MaxChargeCurrent() ==
-        0) // BMS can command an AC charge shutdown if its current limit is 0
-    {
-      RunChg = false; // end charge
-      ChgLck = true;  // set charge lockout flag
-    }
-  }
-  // End Charge Term Logic
-
   if (opmode == MOD_RUN) {
-    ChgLck = false; // reset charge lockout flag when we drive off
+    // Preserve the legacy reset for installations without proximity pilot.
+    // With PP configured, only a confirmed physical unplug clears ChgLck.
+    if (!proxPilotConfigured) {
+      ChgLck = false;
+      acSessionActive = false;
+      acChargeStateSeen = false;
+      SetPersistentAcSessionState(AC_SESSION_IDLE);
+    }
 
     // Brake Vac Sensor
     if (Param::GetInt(Param::GPA1Func) == IOMatrix::VAC_SENSOR ||
@@ -447,9 +585,9 @@ static void Ms100Task(void) {
         ->Task100Ms(); // send the 100ms task request for the lim all the time
                        // and for others if in DC charge mode
 
-  if (selectedChargeInt->DCFCRequest(RunChg) ||
-      ExtHVreq) // Request to run dc fast charge via charge interface or
-                // external pin io
+  if (selectedChargeInt->DCFCRequest(RunDCChg) ||
+      (RunDCChg && ExtHVreq)) // Request DC fast charge via the charge
+                              // interface or permitted external input
   {
     // Here we receive a valid DCFC startup request.
     if (opmode != MOD_RUN)
@@ -464,8 +602,7 @@ static void Ms100Task(void) {
   if (!chargeModeDC) // Request to run ac charge from the interface (e.g. LIM)
                      // if we are NOT in DC charge mode.
   {
-    ACrequest = selectedChargeInt->ACRequest(
-        RunChg); // If using unused always returns true
+    ACrequest = selectedChargeInt->ACRequest(RunACChg);
   }
   // End charge interface logic
 
@@ -1362,6 +1499,7 @@ int main(void) {
   usart2_setup(); // TOYOTA HYBRID INVERTER INTERFACE
   nvic_setup();
   parm_load();
+  RestorePersistentAcSessionState();
   spi2_setup();
   spi3_setup();
   tim3_setup(); // For general purpose PWM output
@@ -1449,3 +1587,4 @@ int main(void) {
 
   return 0;
 }
+
