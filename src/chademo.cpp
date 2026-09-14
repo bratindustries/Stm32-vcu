@@ -3,6 +3,8 @@
  *
  * Copyright (C) 2018 Johannes Huebner <dev@johanneshuebner.com>
  *
+ * changes by Angus Johnson 2026 <info@bratindustries.net>
+ *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
  * the Free Software Foundation, either version 3 of the License, or
@@ -108,6 +110,24 @@ void FCChademo::Task100Ms() // sends chademo messages every 100ms
   uint32_t data[2];
   bool curSensFault = curTimeout > 10;
   bool vtgSensFault = vtgTimeout > 50;
+
+  float udc2 = Param::GetFloat(Param::udc2);
+  data[0] = udc2;
+  data[1] = 0;
+
+  txMessage.frame.idType = dSTANDARD_CAN_MSG_ID_2_0B;
+  txMessage.frame.id = 0x103;
+  txMessage.frame.dlc = 8;
+  txMessage.frame.data0 = (data[0] & 0xFF);
+  txMessage.frame.data1 = (data[0] >> 8 & 0xFF);
+  txMessage.frame.data2 = (data[0] >> 16 & 0xFF);
+  txMessage.frame.data3 = (data[0] >> 24 & 0xFF);
+  txMessage.frame.data4 = (data[1] & 0xFF);
+  txMessage.frame.data5 = (data[1] >> 8 & 0xFF);
+  txMessage.frame.data6 = (data[1] >> 16 & 0xFF);
+  txMessage.frame.data7 = (data[1] >> 24 & 0xFF);
+  CANSPI_Transmit(&txMessage);
+  delay();
 
   // Capacity fixed to 200 - so SoC resolution is 0.5
   data[0] = 0;
@@ -248,11 +268,11 @@ void FCChademo::Task200Ms() {
   Param::SetInt(Param::CCS_V_Avail, FCChademo::GetChargerMaxVoltage());
 }
 
-bool FCChademo::DCFCRequest(bool RunDCChg) {
+bool FCChademo::DCFCRequest(bool RunCh) {
   bool request = IOMatrix::GetPinIn(IOMatrix::DCFCREQUEST)->Get();
 
   // A real high is always required to start a new CHAdeMO session.
-  if (RunDCChg && request) {
+  if (RunCh && request) {
     dcfcSessionActive = true;
     dcfcDropoutTicks = 0;
     return true;
@@ -262,14 +282,13 @@ bool FCChademo::DCFCRequest(bool RunDCChg) {
   // DCFCRequest() is evaluated from the 100ms task, so 6 ticks is ~600ms.
   // Only tolerate control-signal dropouts after the CHAdeMO session
   // has started and the CHAdeMO task has begun running.
-  if (RunDCChg && dcfcSessionActive && chademoStartTime != 0 &&
+  if (RunCh && dcfcSessionActive && chademoStartTime != 0 &&
       dcfcDropoutTicks < DCFC_DROPOUT_LIMIT) {
     dcfcDropoutTicks++;
     return true;
   }
 
-  // Persistent loss of the hardwired request, or DC charge permission being
-  // removed, ends the session.
+  // Persistent loss of the hardwired request, or RunCh being removed, ends the session.
   // Guarded by dcfcSessionActive to prevent continuously spamming shutdown commands
   // over CAN/GPIOs while the vehicle is idle.
   if (dcfcSessionActive) {
@@ -283,6 +302,6 @@ bool FCChademo::DCFCRequest(bool RunDCChg) {
     IOMatrix::GetPinOut(IOMatrix::CHADEMOALLOW)
         ->Clear(); // FCChademo charge allow off
     chademoStartTime = 0;
-    return false;
   }
+  return false;
 }
