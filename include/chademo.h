@@ -31,9 +31,14 @@
 class FCChademo : public Chargerint {
 public:
   void DecodeCAN(int id, uint32_t data[2]);
+  void Task10Ms() override;
   void Task100Ms(); // Must be called every 100ms
   void Task200Ms();
   bool DCFCRequest(bool RunCh);
+  static void SetDcswComplete(bool complete) { dcswComplete = complete; }
+  static bool ShutdownPending();
+  static void ContactorsCleared();
+  static bool NeedsStatusTransmission();
   bool ACRequest(bool RunCh) { return RunCh; };
 
 protected:
@@ -44,6 +49,7 @@ private:
   static bool parkingPosition;
   static bool fault;
   static bool contactorOpen;
+  static bool dcswComplete;
   static uint8_t chargerStatus;
   static uint8_t chargerMaxCurrent;
   static uint16_t chargerMaxVoltage;

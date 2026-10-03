@@ -24,7 +24,8 @@
 bool FCChademo::chargeEnabled = false;
 bool FCChademo::parkingPosition = false;
 bool FCChademo::fault = false;
-bool FCChademo::contactorOpen = false;
+bool FCChademo::contactorOpen = true;
+bool FCChademo::dcswComplete = false;
 bool chargeMode = false;
 uint8_t FCChademo::chargerMaxCurrent;
 uint16_t FCChademo::chargerMaxVoltage;
@@ -45,6 +46,28 @@ static int32_t controlledCurrent = 0;
 static uint8_t dcfcVoltageMatchTicks = 0;
 static const uint8_t DCFC_VOLTAGE_MATCH_TICKS = 3;
 static const uint16_t DCFC_VOLTAGE_MATCH_TOLERANCE = 10; // volts
+static volatile uint16_t dcfcStatusAgeTicks = UINT16_MAX;
+static bool dcfcShutdownPending = false;
+static bool dcfcOpenReportPending = false;
+
+void FCChademo::Task10Ms() {
+  if (dcfcStatusAgeTicks < UINT16_MAX)
+    dcfcStatusAgeTicks++;
+}
+
+bool FCChademo::ShutdownPending() { return dcfcShutdownPending; }
+
+void FCChademo::ContactorsCleared() {
+  if (!dcfcShutdownPending)
+    return;
+  SetContactor(false); // Report open after VCU contactor outputs are cleared.
+  dcfcShutdownPending = false;
+  dcfcOpenReportPending = true;
+}
+
+bool FCChademo::NeedsStatusTransmission() {
+  return dcfcShutdownPending || dcfcOpenReportPending;
+}
 
 uCAN_MSG txMessage;
 
@@ -65,6 +88,7 @@ void FCChademo::DecodeCAN(int id, uint32_t data[2]) {
     chargerOutputVoltage = data[0] >> 8;
     chargerOutputCurrent = data[0] >> 24;
     chargerStatus = (data[1] >> 8) & 0x3F;
+    dcfcStatusAgeTicks = 0;
   }
 }
 
@@ -182,7 +206,10 @@ void FCChademo::Task100Ms() // sends chademo messages every 100ms
   txMessage.frame.data5 = (data[1] >> 8 & 0xFF);
   txMessage.frame.data6 = (data[1] >> 16 & 0xFF);
   txMessage.frame.data7 = (data[1] >> 24 & 0xFF);
-  CANSPI_Transmit(&txMessage);
+  // A final open report must be accepted into a transmit buffer before the
+  // VCU stops scheduling CHAdeMO messages. This is not a delivery ACK.
+  if (CANSPI_Transmit(&txMessage) && contactorOpen && dcfcOpenReportPending)
+    dcfcOpenReportPending = false;
 }
 
 void FCChademo::Task200Ms() {
@@ -228,6 +255,9 @@ void FCChademo::Task200Ms() {
     }
 
     if (dcfcVoltageMatchTicks >= DCFC_VOLTAGE_MATCH_TICKS) {
+      if (dcswComplete)
+        FCChademo::SetContactor(true); // Report closed: 0x102 byte 5, bit 3 = 0.
+
       if (udc < udcspnt && controlledCurrent <= chargeLim)
         controlledCurrent++;
       if (udc > udcspnt && controlledCurrent > 0)
@@ -271,8 +301,17 @@ void FCChademo::Task200Ms() {
 bool FCChademo::DCFCRequest(bool RunCh) {
   bool request = IOMatrix::GetPinIn(IOMatrix::DCFCREQUEST)->Get();
 
+  // A returning request must not cancel shutdown or change the contactor
+  // report before the outputs clear and the final open report is queued.
+  if (dcfcShutdownPending || dcfcOpenReportPending)
+    return false;
+
   // A real high is always required to start a new CHAdeMO session.
   if (RunCh && request) {
+    if (!dcfcSessionActive) {
+      FCChademo::SetContactor(false); // Start each new session reporting open.
+    }
+
     dcfcSessionActive = true;
     dcfcDropoutTicks = 0;
     return true;
@@ -293,6 +332,7 @@ bool FCChademo::DCFCRequest(bool RunCh) {
   // over CAN/GPIOs while the vehicle is idle.
   if (dcfcSessionActive) {
     dcfcSessionActive = false;
+    dcfcShutdownPending = true;
     dcfcDropoutTicks = 0;
     dcfcVoltageMatchTicks = 0;
     controlledCurrent = 0;

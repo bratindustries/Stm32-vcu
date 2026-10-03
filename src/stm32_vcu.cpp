@@ -445,14 +445,18 @@ static void Ms100Task(void) {
 
   // Charge interface logic
   if (targetChgint == ChargeInterfaces::i3LIM ||
-      targetChgint == ChargeInterfaces::Foccci || chargeModeDC)
+      targetChgint == ChargeInterfaces::Foccci || chargeModeDC ||
+      (targetChgint == ChargeInterfaces::Chademo &&
+       FCChademo::NeedsStatusTransmission()))
     selectedChargeInt
         ->Task100Ms(); // send the 100ms task request for the lim all the time
                        // and for others if in DC charge mode
 
-  if (selectedChargeInt->DCFCRequest(RunDCChg) ||
-      (RunDCChg && ExtHVreq)) // Request DC fast charge via the charge
-                              // interface or permitted external input
+  const bool dcfcRequested = selectedChargeInt->DCFCRequest(RunDCChg);
+  const bool dcfcShutdownBlocked =
+      targetChgint == ChargeInterfaces::Chademo &&
+      FCChademo::NeedsStatusTransmission();
+  if (!dcfcShutdownBlocked && (dcfcRequested || (RunDCChg && ExtHVreq)))
   {
     // Here we receive a valid DCFC startup request.
     if (opmode != MOD_RUN)
@@ -716,6 +720,8 @@ static void Ms10Task(void) {
       IOMatrix::GetPinOut(IOMatrix::NEGCONTACTOR)
           ->Clear(); // Negative contactors off if used
       DigIo::prec_out.Clear();
+      if (targetChgint == ChargeInterfaces::Chademo)
+        FCChademo::ContactorsCleared();
     }
 
     if (Param::GetInt(Param::pot) < Param::GetInt(Param::potmin)) {
@@ -862,6 +868,9 @@ static void Ms10Task(void) {
     }
     break;
   }
+
+  if (targetChgint == ChargeInterfaces::Chademo)
+    FCChademo::SetDcswComplete(opmode == MOD_CHARGE && DigIo::dcsw_out.Get());
 
   ControlCabHeater(opmode);
   if (Param::GetInt(Param::ShuntType) == 2)
