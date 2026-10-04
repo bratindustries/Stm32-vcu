@@ -60,11 +60,17 @@ static uint16_t EvseCurrentLimit(uint8_t duty) {
 bool outlanderCharger::ControlCharge(bool RunCh, bool ACReq) {
   bool proxRequest = RunCh && Param::GetBool(Param::PlugDet);
 
-  // When the Outlander charger is selected, PP can start AC charging without
-  // depending on the selected charge interface. The OBC is brought into
-  // MOD_CHARGE first so its heartbeat can wake it and obtain EVSE duty.
+  // PP requests AC charging independently of the selected charge interface,
+  // but a fresh, valid 0x38A must arrive before requesting precharge. Keep the
+  // accepted request latched through precharge and charge; Task100Ms handles
+  // pilot loss with zero current and the existing EVSE timeout.
   if (proxRequest) {
-    clearToStart = !EvseTimeout;
+    bool pilotValid = evseDutyAge <= EVSEDUTYSTALE &&
+                      EvseCurrentLimit(evseDuty) > 0;
+    int mode = Param::GetInt(Param::opmode);
+    bool keepRequest = clearToStart &&
+                       (mode == MOD_PRECHARGE || mode == MOD_CHARGE);
+    clearToStart = !EvseTimeout && (pilotValid || keepRequest);
     return clearToStart;
   }
 
