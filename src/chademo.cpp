@@ -47,6 +47,8 @@ static uint8_t dcfcVoltageMatchTicks = 0;
 static const uint8_t DCFC_VOLTAGE_MATCH_TICKS = 3;
 static const uint16_t DCFC_VOLTAGE_MATCH_TOLERANCE = 10; // volts
 static volatile uint16_t dcfcStatusAgeTicks = UINT16_MAX;
+static const uint16_t DCFC_STATUS_FRESH_TICKS = 100; // 100 x 10ms = 1 second
+static bool dcfcVoltageMatchLatched = false;
 static bool dcfcShutdownPending = false;
 static bool dcfcOpenReportPending = false;
 
@@ -227,6 +229,7 @@ void FCChademo::Task200Ms() {
   }
 
   if (Param::GetInt(Param::opmode) == MOD_CHARGE &&
+      dcfcStatusAgeTicks <= DCFC_STATUS_FRESH_TICKS &&
       FCChademo::ConnectorLocked()) {
     Param::SetInt(Param::chgtyp, DCFC);
     chargeMode = true; // DC charge mode
@@ -247,14 +250,23 @@ void FCChademo::Task200Ms() {
     // The charger-side voltage only matches UDC after CHAdeMO pin 10 has
     // closed the dedicated charge contactors. Keep the current request at zero
     // until the voltages have matched for three consecutive 200 ms checks.
-    if (ccsV > 50 && ABS(udc - ccsV) <= DCFC_VOLTAGE_MATCH_TOLERANCE) {
-      if (dcfcVoltageMatchTicks < DCFC_VOLTAGE_MATCH_TICKS)
-        dcfcVoltageMatchTicks++;
-    } else {
-      dcfcVoltageMatchTicks = 0;
+    // Only fresh 0x109 data may satisfy the initial voltage-match gate.
+    // Once the startup check passes, latch it for the rest of the session.
+    if (!dcfcVoltageMatchLatched) {
+      if (dcfcStatusAgeTicks <= DCFC_STATUS_FRESH_TICKS &&
+          ccsV > 50 &&
+          ABS(udc - ccsV) <= DCFC_VOLTAGE_MATCH_TOLERANCE) {
+        if (dcfcVoltageMatchTicks < DCFC_VOLTAGE_MATCH_TICKS)
+          dcfcVoltageMatchTicks++;
+
+        if (dcfcVoltageMatchTicks >= DCFC_VOLTAGE_MATCH_TICKS)
+          dcfcVoltageMatchLatched = true;
+      } else {
+        dcfcVoltageMatchTicks = 0;
+      }
     }
 
-    if (dcfcVoltageMatchTicks >= DCFC_VOLTAGE_MATCH_TICKS) {
+    if (dcfcVoltageMatchLatched) {
       if (dcswComplete)
         FCChademo::SetContactor(true); // Report closed: 0x102 byte 5, bit 3 = 0.
 
@@ -274,6 +286,7 @@ void FCChademo::Task200Ms() {
   } else {
     controlledCurrent = 0;
     dcfcVoltageMatchTicks = 0;
+    dcfcVoltageMatchLatched = false;
     FCChademo::SetChargeCurrent(0);
   }
 
@@ -284,6 +297,7 @@ void FCChademo::Task200Ms() {
   if (Param::GetInt(Param::CCS_ILim) == 0) {
     controlledCurrent = 0;
     dcfcVoltageMatchTicks = 0;
+    dcfcVoltageMatchLatched = false;
     FCChademo::SetChargeCurrent(0);
     FCChademo::SetEnabled(false);
     IOMatrix::GetPinOut(IOMatrix::CHADEMOALLOW)
@@ -310,6 +324,8 @@ bool FCChademo::DCFCRequest(bool RunCh) {
   if (RunCh && request) {
     if (!dcfcSessionActive) {
       FCChademo::SetContactor(false); // Start each new session reporting open.
+      dcfcVoltageMatchTicks = 0;
+      dcfcVoltageMatchLatched = false;
     }
 
     dcfcSessionActive = true;
@@ -335,6 +351,7 @@ bool FCChademo::DCFCRequest(bool RunCh) {
     dcfcShutdownPending = true;
     dcfcDropoutTicks = 0;
     dcfcVoltageMatchTicks = 0;
+    dcfcVoltageMatchLatched = false;
     controlledCurrent = 0;
     chargeMode = false;
     FCChademo::SetChargeCurrent(0);
