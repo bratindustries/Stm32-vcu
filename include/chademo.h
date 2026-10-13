@@ -39,6 +39,7 @@ public:
   static bool ShutdownPending();
   static void ContactorsCleared();
   static bool NeedsStatusTransmission();
+  static bool RestartBlocked();
   bool ACRequest(bool RunCh) { return RunCh; };
 
 protected:

@@ -302,7 +302,9 @@ static void Ms200Task(void) {
 
   // Check if we want to AC charge via charger
   if (selectedCharger->ControlCharge(RunACChg, ACrequest) &&
-      (opmode != MOD_RUN)) {
+      (opmode != MOD_RUN) &&
+      !(targetChgint == ChargeInterfaces::Chademo &&
+        FCChademo::RestartBlocked())) {
     chargeMode = true; // AC charge mode
     Param::SetInt(Param::chgtyp, AC);
   } else if (!chargeModeDC) {
@@ -455,7 +457,7 @@ static void Ms100Task(void) {
   const bool dcfcRequested = selectedChargeInt->DCFCRequest(RunDCChg);
   const bool dcfcShutdownBlocked =
       targetChgint == ChargeInterfaces::Chademo &&
-      FCChademo::NeedsStatusTransmission();
+      FCChademo::RestartBlocked();
   if (!dcfcShutdownBlocked && (dcfcRequested || (RunDCChg && ExtHVreq)))
   {
     // Here we receive a valid DCFC startup request.

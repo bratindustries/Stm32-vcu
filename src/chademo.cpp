@@ -51,6 +51,8 @@ static const uint16_t DCFC_STATUS_FRESH_TICKS = 100; // 100 x 10ms = 1 second
 static bool dcfcVoltageMatchLatched = false;
 static bool dcfcShutdownPending = false;
 static bool dcfcOpenReportPending = false;
+static bool dcfcStationStopArmed = false;
+static bool dcfcStopLatched = false;
 
 void FCChademo::Task10Ms() {
   if (dcfcStatusAgeTicks < UINT16_MAX)
@@ -69,6 +71,10 @@ void FCChademo::ContactorsCleared() {
 
 bool FCChademo::NeedsStatusTransmission() {
   return dcfcShutdownPending || dcfcOpenReportPending;
+}
+
+bool FCChademo::RestartBlocked() {
+  return NeedsStatusTransmission() || dcfcStopLatched;
 }
 
 uCAN_MSG txMessage;
@@ -320,12 +326,46 @@ bool FCChademo::DCFCRequest(bool RunCh) {
   if (dcfcShutdownPending || dcfcOpenReportPending)
     return false;
 
+  // A station stop or completed charge must not restart from a held-high pin 2.
+  // Rearm only after the station removes its hardwired request.
+  if (dcfcStopLatched) {
+    if (!request)
+      dcfcStopLatched = false;
+    else
+      return false;
+  }
+
+  bool stationStop = false;
+  if (dcfcSessionActive && dcfcStatusAgeTicks <= DCFC_STATUS_FRESH_TICKS) {
+    // Bit 5 can be set during the initial handshake. Observe it cleared
+    // in this session before accepting a later set as a stop request.
+    if ((chargerStatus & 0x20) == 0)
+      dcfcStationStopArmed = true;
+    else if (dcfcStationStopArmed) {
+      stationStop = true;
+    }
+  }
+
+  // Finish at target voltage once fresh station-reported current has tapered
+  // to IdcTerm. Require startup voltage matching first.
+  const int targetVoltage = Param::GetInt(Param::Voltspnt);
+  const bool targetReached = dcfcSessionActive && dcfcVoltageMatchLatched &&
+                             targetVoltage > 0 &&
+                             Param::GetInt(Param::udc) >= targetVoltage &&
+                             dcfcStatusAgeTicks <= DCFC_STATUS_FRESH_TICKS &&
+                             FCChademo::GetChargerOutputCurrent() <=
+                                 Param::GetFloat(Param::IdcTerm);
+  const bool stopSession = stationStop || targetReached;
+  if (stopSession)
+    dcfcStopLatched = true;
+
   // A real high is always required to start a new CHAdeMO session.
-  if (RunCh && request) {
+  if (RunCh && request && !stopSession) {
     if (!dcfcSessionActive) {
       FCChademo::SetContactor(false); // Start each new session reporting open.
       dcfcVoltageMatchTicks = 0;
       dcfcVoltageMatchLatched = false;
+      dcfcStationStopArmed = false;
     }
 
     dcfcSessionActive = true;
@@ -337,17 +377,18 @@ bool FCChademo::DCFCRequest(bool RunCh) {
   // DCFCRequest() is evaluated from the 100ms task, so 6 ticks is ~600ms.
   // Only tolerate control-signal dropouts after the CHAdeMO session
   // has started and the CHAdeMO task has begun running.
-  if (RunCh && dcfcSessionActive && chademoStartTime != 0 &&
+  if (!stopSession && RunCh && dcfcSessionActive && chademoStartTime != 0 &&
       dcfcDropoutTicks < DCFC_DROPOUT_LIMIT) {
     dcfcDropoutTicks++;
     return true;
   }
 
-  // Persistent loss of the hardwired request, or RunCh being removed, ends the session.
+  // Target voltage, a fresh station stop, request loss, or RunCh removal ends the session.
   // Guarded by dcfcSessionActive to prevent continuously spamming shutdown commands
   // over CAN/GPIOs while the vehicle is idle.
   if (dcfcSessionActive) {
     dcfcSessionActive = false;
+    dcfcStationStopArmed = false;
     dcfcShutdownPending = true;
     dcfcDropoutTicks = 0;
     dcfcVoltageMatchTicks = 0;
