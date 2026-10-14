@@ -302,9 +302,7 @@ static void Ms200Task(void) {
 
   // Check if we want to AC charge via charger
   if (selectedCharger->ControlCharge(RunACChg, ACrequest) &&
-      (opmode != MOD_RUN) &&
-      !(targetChgint == ChargeInterfaces::Chademo &&
-        FCChademo::RestartBlocked())) {
+      (opmode != MOD_RUN)) {
     chargeMode = true; // AC charge mode
     Param::SetInt(Param::chgtyp, AC);
   } else if (!chargeModeDC) {
