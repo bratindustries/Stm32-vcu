@@ -141,8 +141,7 @@ static bool ppUnplugConfirmed = false;
 static uint8_t ppUnplugTicks = 0;
 static PersistentAcSessionState persistentAcSessionState = AC_SESSION_IDLE;
 static CanHardware *canInterface[3];
-// The periodic task requests a save; only the main loop writes flash.
-static volatile bool isaSocSavePending = false;
+// One reset per VCU boot, regardless of enable toggles after triggering.
 static uint16_t isaSocQualifyTicks = 0;
 static bool isaSocResetIssued = false;
 static CanMap *canMap;
@@ -523,7 +522,6 @@ static void Ms200Task(void) {
 static void CheckIsaSocReset(void) {
   if (Param::GetInt(Param::IsaSocReset) != 1) {
     isaSocQualifyTicks = 0;
-    isaSocResetIssued = false;
     return;
   }
 
@@ -556,8 +554,7 @@ static void CheckIsaSocReset(void) {
 
   isaSocResetIssued = true;
   ISA::RESTART(canInterface[Param::GetInt(Param::ShuntCan)]);
-  Param::SetInt(Param::IsaSocReset, 0);
-  isaSocSavePending = true;
+  // Leave IsaSocReset enabled for the next power cycle.
   isaSocQualifyTicks = 0;
 }
 
@@ -1696,10 +1693,6 @@ int main(void) {
     char c = 0;
     CanSdo::SdoFrame *sdoFrame = sdo.GetPendingUserspaceSdo();
     t.Run();
-    if (isaSocSavePending) {
-      isaSocSavePending = false;
-      TerminalCommands::SaveParameters(&t, nullptr);
-    }
     if (sdo.GetPrintRequest() == PRINT_JSON) {
       TerminalCommands::PrintParamsJson(&sdo, &c);
     }
