@@ -534,8 +534,9 @@ static void CheckIsaSocReset(void) {
     return;
   }
 
-  // ISA pack-side voltage, with absolute shunt current (either polarity).
-  const float voltage = Param::GetFloat(Param::udc2);
+  // Match UdcFresh() (ISA CAN 0x522) to the voltage being checked.
+  // udc2 comes from CAN 0x523 and has no corresponding freshness check.
+  const float voltage = Param::GetFloat(Param::udc);
   float current = Param::GetFloat(Param::idc);
   if (current < 0)
     current = -current;
