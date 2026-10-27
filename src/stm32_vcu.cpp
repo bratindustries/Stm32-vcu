@@ -141,6 +141,10 @@ static bool ppUnplugConfirmed = false;
 static uint8_t ppUnplugTicks = 0;
 static PersistentAcSessionState persistentAcSessionState = AC_SESSION_IDLE;
 static CanHardware *canInterface[3];
+// The periodic task requests a save; only the main loop writes flash.
+static volatile bool isaSocSavePending = false;
+static uint16_t isaSocQualifyTicks = 0;
+static bool isaSocResetIssued = false;
 static CanMap *canMap;
 static CanSdo *canSdo;
 static ChargeModes targetCharger;
@@ -516,6 +520,46 @@ static void Ms200Task(void) {
   preheater.Task200Ms(opmode, hours, minutes);
 }
 
+static void CheckIsaSocReset(void) {
+  if (Param::GetInt(Param::IsaSocReset) != 1) {
+    isaSocQualifyTicks = 0;
+    isaSocResetIssued = false;
+    return;
+  }
+
+  const int shuntType = Param::GetInt(Param::ShuntType);
+  if ((shuntType != 1 && shuntType != 4) || !utils::UdcFresh() ||
+      !utils::IdcFresh() || isaSocResetIssued) {
+    isaSocQualifyTicks = 0;
+    return;
+  }
+
+  // ISA pack-side voltage, with absolute shunt current (either polarity).
+  const float voltage = Param::GetFloat(Param::udc2);
+  float current = Param::GetFloat(Param::idc);
+  if (current < 0)
+    current = -current;
+
+  if (voltage < Param::GetFloat(Param::IsaFullVolt) ||
+      current > Param::GetFloat(Param::IsaFullCurrent)) {
+    isaSocQualifyTicks = 0;
+    return;
+  }
+
+  const uint16_t requiredTicks =
+      (uint16_t)(Param::GetInt(Param::IsaFullDelay) * 10);
+  if (isaSocQualifyTicks < requiredTicks)
+    ++isaSocQualifyTicks;
+  if (isaSocQualifyTicks < requiredTicks)
+    return;
+
+  isaSocResetIssued = true;
+  ISA::RESTART(canInterface[Param::GetInt(Param::ShuntCan)]);
+  Param::SetInt(Param::IsaSocReset, 0);
+  isaSocSavePending = true;
+  isaSocQualifyTicks = 0;
+}
+
 static void Ms100Task(void) {
   DigIo::led_out.Toggle();
   iwdg_reset();
@@ -525,6 +569,7 @@ static void Ms100Task(void) {
   Param::SetInt(Param::lasterr, ErrorMessage::GetLastError());
   int opmode = Param::GetInt(Param::opmode);
   utils::SelectDirection(selectedVehicle, selectedShifter);
+  CheckIsaSocReset();
 
   if (Param::GetInt(Param::ShuntType) != 0) // Do not do any SOC calcs
   {
@@ -1650,6 +1695,10 @@ int main(void) {
     char c = 0;
     CanSdo::SdoFrame *sdoFrame = sdo.GetPendingUserspaceSdo();
     t.Run();
+    if (isaSocSavePending) {
+      isaSocSavePending = false;
+      TerminalCommands::SaveParameters(&t, nullptr);
+    }
     if (sdo.GetPrintRequest() == PRINT_JSON) {
       TerminalCommands::PrintParamsJson(&sdo, &c);
     }
