@@ -128,7 +128,7 @@
   PARAM_ENTRY(CAT_CLOCK, Pre_Min, "Mins", 0, 59, 0, 54)                        \
   PARAM_ENTRY(CAT_CLOCK, Pre_Dur, "Mins", 0, 60, 0, 55)                        \
   PARAM_ENTRY(CAT_IOPINS, PumpPWM, PumpOutType, 0, 2, 0, 135)                  \
-  PARAM_ENTRY(CAT_IOPINS, Out1Func, PINOUTFUNCS, 0, 14, 6, 80)                 \
+  PARAM_ENTRY(CAT_IOPINS, Out1Func, PINOUTFUNCS, 0, 14, 7, 80)                 \
   PARAM_ENTRY(CAT_IOPINS, Out2Func, PINOUTFUNCS, 0, 14, 7, 81)                 \
   PARAM_ENTRY(CAT_IOPINS, Out3Func, PINOUTFUNCS, 0, 14, 3, 82)                 \
   PARAM_ENTRY(CAT_IOPINS, SL1Func, PINOUTFUNCS, 0, 14, 0, 83)                  \
