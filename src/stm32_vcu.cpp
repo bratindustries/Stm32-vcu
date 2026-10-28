@@ -146,6 +146,9 @@ static bool ppUnplugConfirmed = false;
 static uint8_t ppUnplugTicks = 0;
 static PersistentAcSessionState persistentAcSessionState = AC_SESSION_IDLE;
 static CanHardware *canInterface[3];
+// Reset at most once per charge-mode session.
+static uint16_t isaSocQualifyTicks = 0;
+static bool isaSocResetIssued = false;
 static CanMap *canMap;
 static CanSdo *canSdo;
 static ChargeModes targetCharger;
@@ -530,6 +533,52 @@ static void Ms200Task(void) {
   preheater.Task200Ms(opmode, hours, minutes);
 }
 
+static void CheckIsaSocReset(void) {
+  // Leaving charge mode rearms the reset for the next charging session.
+  if (Param::GetInt(Param::opmode) != MOD_CHARGE) {
+    isaSocQualifyTicks = 0;
+    isaSocResetIssued = false;
+    return;
+  }
+
+  if (Param::GetInt(Param::IsaSocReset) != 1) {
+    isaSocQualifyTicks = 0;
+    return;
+  }
+
+  const int shuntType = Param::GetInt(Param::ShuntType);
+  if ((shuntType != 1 && shuntType != 4) || !utils::UdcFresh() ||
+      !utils::IdcFresh() || isaSocResetIssued) {
+    isaSocQualifyTicks = 0;
+    return;
+  }
+
+  // Match UdcFresh() (ISA CAN 0x522) to the voltage being checked.
+  // udc2 comes from CAN 0x523 and has no corresponding freshness check.
+  const float voltage = Param::GetFloat(Param::udc);
+  float current = Param::GetFloat(Param::idc);
+  if (current < 0)
+    current = -current;
+
+  if (voltage < Param::GetFloat(Param::IsaFullVolt) ||
+      current > Param::GetFloat(Param::IsaFullCurrent)) {
+    isaSocQualifyTicks = 0;
+    return;
+  }
+
+  const uint16_t requiredTicks =
+      (uint16_t)(Param::GetInt(Param::IsaFullDelay) * 10);
+  if (isaSocQualifyTicks < requiredTicks)
+    ++isaSocQualifyTicks;
+  if (isaSocQualifyTicks < requiredTicks)
+    return;
+
+  isaSocResetIssued = true;
+  ISA::RESTART(canInterface[Param::GetInt(Param::ShuntCan)]);
+  // Keep IsaSocReset enabled; exiting charge mode rearms the next session.
+  isaSocQualifyTicks = 0;
+}
+
 static void Ms100Task(void) {
   DigIo::led_out.Toggle();
   iwdg_reset();
@@ -539,6 +588,7 @@ static void Ms100Task(void) {
   Param::SetInt(Param::lasterr, ErrorMessage::GetLastError());
   int opmode = Param::GetInt(Param::opmode);
   utils::SelectDirection(selectedVehicle, selectedShifter);
+  CheckIsaSocReset();
 
   if (Param::GetInt(Param::ShuntType) != 0) // Do not do any SOC calcs
   {
