@@ -114,8 +114,8 @@
 #define PRECHARGE_TIMEOUT 5 // 5s
 #define PP_UNPLUG_CONFIRM_TICKS 5 // 5 x 200ms = 1s confirmed unplug
 
-// Stored in the STM32 backup domain so an AC completion lock survives a CPU
-// reset or short 12V brownout. Each value includes a signature so unrelated or
+// Stored in the STM32 backup domain so an Outlander AC completion lock survives
+// a CPU reset or short 12V brownout. Each value includes a signature so unrelated or
 // uninitialised backup-register contents are rejected.
 enum PersistentAcSessionState : uint16_t {
   AC_SESSION_IDLE = 0xAC00,
@@ -252,6 +252,9 @@ static void SetPersistentAcSessionState(PersistentAcSessionState state) {
 }
 
 static void RestorePersistentAcSessionState() {
+  if (Param::GetInt(Param::chargemodes) != ChargeModes::Out_lander)
+    return;
+
   const bool proxPilotConfigured =
       Param::GetInt(Param::GPA1Func) == IOMatrix::PILOT_PROX ||
       Param::GetInt(Param::GPA2Func) == IOMatrix::PILOT_PROX;
@@ -279,17 +282,19 @@ static void RestorePersistentAcSessionState() {
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 static void Ms200Task(void) {
   int opmode = Param::GetInt(Param::opmode);
+  const bool outlanderObc =
+      Param::GetInt(Param::chargemodes) == ChargeModes::Out_lander;
   const bool proxPilotConfigured =
       Param::GetInt(Param::GPA1Func) == IOMatrix::PILOT_PROX ||
       Param::GetInt(Param::GPA2Func) == IOMatrix::PILOT_PROX;
 
-  // Remember that this AC request made it all the way into charge mode. If
+  // Remember that this Outlander AC request reached charge mode. If
   // another part of the state machine forces it out while the request remains
   // asserted, latch the completed/aborted session before it can precharge
   // again.
-  if (acSessionActive && opmode == MOD_CHARGE && !chargeModeDC)
+  if (outlanderObc && acSessionActive && opmode == MOD_CHARGE && !chargeModeDC)
     acChargeStateSeen = true;
-  if (acChargeStateSeen && opmode != MOD_CHARGE) {
+  if (outlanderObc && acChargeStateSeen && opmode != MOD_CHARGE) {
     RunACChg = false;
     ChgLck = true;
     if (proxPilotConfigured)
@@ -366,18 +371,20 @@ static void Ms200Task(void) {
     int ppValue = IOMatrix::GetAnaloguePin(IOMatrix::PILOT_PROX)->Get();
     Param::SetInt(Param::PPVal, ppValue);
 
-    // Re-arm a completed AC session only after PP has continuously reported
+    // Re-arm a completed Outlander session only after PP has continuously reported
     // unplugged, followed by a new plug-in. This prevents a PP transient while
     // the EVSE or OBC is shutting down from clearing the completion latch.
     if (ppValue <= ppThresh) {
-      if (ChgLck && ppUnplugConfirmed) {
+      if (outlanderObc && ChgLck && ppUnplugConfirmed) {
         ChgLck = false;
         acSessionActive = false;
         acChargeStateSeen = false;
         SetPersistentAcSessionState(AC_SESSION_IDLE);
       }
-      ppUnplugTicks = 0;
-      ppUnplugConfirmed = false;
+      if (outlanderObc) {
+        ppUnplugTicks = 0;
+        ppUnplugConfirmed = false;
+      }
 
       if (ChgSet == 1 && !ChgLck) {
         RunACChg = true;
@@ -389,7 +396,7 @@ static void Ms200Task(void) {
       RunACChg = false;
       Param::SetInt(Param::PlugDet, 0);
 
-      if (ChgLck) {
+      if (outlanderObc && ChgLck) {
         if (ppUnplugTicks < PP_UNPLUG_CONFIRM_TICKS)
           ppUnplugTicks++;
         if (ppUnplugTicks >= PP_UNPLUG_CONFIRM_TICKS) {
@@ -398,10 +405,23 @@ static void Ms200Task(void) {
           acChargeStateSeen = false;
           SetPersistentAcSessionState(AC_SESSION_LOCKED_UNPLUGGED);
         }
-      } else {
+      } else if (outlanderObc) {
         ppUnplugTicks = 0;
         ppUnplugConfirmed = false;
       }
+    }
+  }
+
+  // Other chargers retain the original control call before termination, with
+  // ChgLck affecting RunACChg rather than overriding the charger's decision.
+  if (!outlanderObc) {
+    if (selectedCharger->ControlCharge(RunACChg, ACrequest) &&
+        opmode != MOD_RUN) {
+      chargeMode = true;
+      Param::SetInt(Param::chgtyp, AC);
+    } else if (!chargeModeDC) {
+      Param::SetInt(Param::chgtyp, OFF);
+      chargeMode = false;
     }
   }
 
@@ -410,66 +430,70 @@ static void Ms200Task(void) {
   ///////////////////////////////////////
   /*
   If we are in AC charge mode and battV >= setpoint and current is <= the
-  termination setpoint, end charge and require an unplug before another AC
-  session. The BMS may also terminate AC charging by commanding 0A.
+  termination setpoint, end charge. Outlander requires an unplug before another
+  AC session. The BMS may also terminate AC charging by commanding 0A.
   */
   if (opmode == MOD_CHARGE && !chargeModeDC) {
     if (Param::GetInt(Param::udc) >= Param::GetInt(Param::Voltspnt) &&
         Param::GetInt(Param::idc) <= Param::GetInt(Param::IdcTerm)) {
       RunACChg = false;
       ChgLck = true;
-      if (proxPilotConfigured)
+      if (outlanderObc && proxPilotConfigured)
         SetPersistentAcSessionState(AC_SESSION_LOCKED_PLUGGED);
     }
 
     if (selectedBMS->MaxChargeCurrent() == 0) {
       RunACChg = false;
       ChgLck = true;
-      if (proxPilotConfigured)
+      if (outlanderObc && proxPilotConfigured)
         SetPersistentAcSessionState(AC_SESSION_LOCKED_PLUGGED);
     }
   }
 
-  // A completed AC charge remains inhibited while the cable is connected.
-  if (ChgLck)
-    RunACChg = false;
+  // Outlander-only session locking and immediate charge-request inhibition.
+  if (outlanderObc) {
+    // A completed AC charge remains inhibited while the cable is connected.
+    if (ChgLck)
+      RunACChg = false;
 
-  // END setting of AC and DC charge permissions
+    // END setting of AC and DC charge permissions
 
-  // Check if we want to AC charge via charger
-  bool acChargeRequested =
-      selectedCharger->ControlCharge(RunACChg && !ChgLck, ACrequest);
+    // Check if we want to AC charge via charger
+    bool acChargeRequested =
+        selectedCharger->ControlCharge(RunACChg && !ChgLck, ACrequest);
 
-  // Also latch an AC session that the charger, EVSE, or PP signal ends before
-  // the generic voltage/current termination test catches it. A real unplug
-  // confirms and re-arms the latch separately; it must not bypass the latch.
-  if (acSessionActive && !acChargeRequested && opmode != MOD_RUN) {
-    RunACChg = false;
-    ChgLck = true;
-    if (proxPilotConfigured)
-      SetPersistentAcSessionState(AC_SESSION_LOCKED_PLUGGED);
+    // Also latch an AC session that the charger, EVSE, or PP signal ends before
+    // the generic voltage/current termination test catches it. A real unplug
+    // confirms and re-arms the latch separately; it must not bypass the latch.
+    if (acSessionActive && !acChargeRequested && opmode != MOD_RUN) {
+      RunACChg = false;
+      ChgLck = true;
+      if (proxPilotConfigured)
+        SetPersistentAcSessionState(AC_SESSION_LOCKED_PLUGGED);
+    }
+
+    if (!ChgLck && acChargeRequested && (opmode != MOD_RUN)) {
+      acSessionActive = true;
+      if (proxPilotConfigured)
+        SetPersistentAcSessionState(AC_SESSION_ACTIVE);
+      chargeMode = true; // AC charge mode
+      Param::SetInt(Param::chgtyp, AC);
+    } else if (!chargeModeDC) {
+      Param::SetInt(Param::chgtyp, OFF);
+      chargeMode = false; // no charge mode
+    }
+    // end check
   }
-
-  if (!ChgLck && acChargeRequested && (opmode != MOD_RUN)) {
-    acSessionActive = true;
-    if (proxPilotConfigured)
-      SetPersistentAcSessionState(AC_SESSION_ACTIVE);
-    chargeMode = true; // AC charge mode
-    Param::SetInt(Param::chgtyp, AC);
-  } else if (!chargeModeDC) {
-    Param::SetInt(Param::chgtyp, OFF);
-    chargeMode = false; // no charge mode
-  }
-  // end check
 
   if (opmode == MOD_RUN) {
-    // Preserve the legacy reset for installations without proximity pilot.
-    // With PP configured, only a confirmed physical unplug clears ChgLck.
-    if (!proxPilotConfigured) {
+    // Other chargers reset ChgLck when driving, as in the original code.
+    // Outlander with PP requires a confirmed physical unplug instead.
+    if (!outlanderObc || !proxPilotConfigured) {
       ChgLck = false;
       acSessionActive = false;
       acChargeStateSeen = false;
-      SetPersistentAcSessionState(AC_SESSION_IDLE);
+      if (outlanderObc)
+        SetPersistentAcSessionState(AC_SESSION_IDLE);
     }
 
     // Brake Vac Sensor
