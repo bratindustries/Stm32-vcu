@@ -141,7 +141,7 @@ static bool ppUnplugConfirmed = false;
 static uint8_t ppUnplugTicks = 0;
 static PersistentAcSessionState persistentAcSessionState = AC_SESSION_IDLE;
 static CanHardware *canInterface[3];
-// One reset per VCU boot, regardless of enable toggles after triggering.
+// Reset at most once per charge-mode session.
 static uint16_t isaSocQualifyTicks = 0;
 static bool isaSocResetIssued = false;
 static CanMap *canMap;
@@ -520,6 +520,13 @@ static void Ms200Task(void) {
 }
 
 static void CheckIsaSocReset(void) {
+  // Leaving charge mode rearms the reset for the next charging session.
+  if (Param::GetInt(Param::opmode) != MOD_CHARGE) {
+    isaSocQualifyTicks = 0;
+    isaSocResetIssued = false;
+    return;
+  }
+
   if (Param::GetInt(Param::IsaSocReset) != 1) {
     isaSocQualifyTicks = 0;
     return;
@@ -554,7 +561,7 @@ static void CheckIsaSocReset(void) {
 
   isaSocResetIssued = true;
   ISA::RESTART(canInterface[Param::GetInt(Param::ShuntCan)]);
-  // Leave IsaSocReset enabled for the next power cycle.
+  // Keep IsaSocReset enabled; exiting charge mode rearms the next session.
   isaSocQualifyTicks = 0;
 }
 
