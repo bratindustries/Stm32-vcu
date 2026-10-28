@@ -108,6 +108,7 @@
 #include "vehicles/vehicle.h"
 #include <libopencm3/stm32/can.h>
 #include <libopencm3/stm32/exti.h>
+#include <libopencm3/stm32/f1/bkp.h>
 #include <libopencm3/stm32/iwdg.h>
 #include <libopencm3/stm32/rtc.h>
 #include <libopencm3/stm32/spi.h>
@@ -116,6 +117,17 @@
 #include <stdint.h>
 
 #define PRECHARGE_TIMEOUT 5 // 5s
+#define PP_UNPLUG_CONFIRM_TICKS 5 // 5 x 200ms = 1s confirmed unplug
+
+// Stored in the STM32 backup domain so an AC completion lock survives a CPU
+// reset or short 12V brownout. Each value includes a signature so unrelated or
+// uninitialised backup-register contents are rejected.
+enum PersistentAcSessionState : uint16_t {
+  AC_SESSION_IDLE = 0xAC00,
+  AC_SESSION_ACTIVE = 0xAC01,
+  AC_SESSION_LOCKED_PLUGGED = 0xAC02,
+  AC_SESSION_LOCKED_UNPLUGGED = 0xAC03
+};
 
 #define PRINT_JSON 0
 
@@ -128,6 +140,11 @@ static Stm32Scheduler *scheduler;
 static bool chargeMode = false;
 static bool chargeModeDC = false;
 static bool ChgLck = false;
+static bool acSessionActive = false;
+static bool acChargeStateSeen = false;
+static bool ppUnplugConfirmed = false;
+static uint8_t ppUnplugTicks = 0;
+static PersistentAcSessionState persistentAcSessionState = AC_SESSION_IDLE;
 static CanHardware *canInterface[3];
 static CanMap *canMap;
 static CanSdo *canSdo;
@@ -135,7 +152,9 @@ static ChargeModes targetCharger;
 static ChargeInterfaces targetChgint;
 static uint8_t ChgSet; // Temp variable storing Param::Chgctrl. 0=enable,
                        // 1=disable, 2=timer.
-static bool RunChg;
+static bool RunACChg = false;
+static bool RunDCChg = true; // DC charging is controlled by its interface,
+                             // not by Chgctrl.
 static uint8_t ChgHrs_tmp;
 static uint8_t ChgMins_tmp;
 static uint16_t ChgDur_tmp;
@@ -154,6 +173,16 @@ static volatile unsigned days = 0, hours = 0, minutes = 0, seconds = 0,
 
 static uint16_t rlyDly = 25;
 static uint16_t prechargeMinTime = 100;
+static const uint16_t DCSW_DELAY = 25; // 250 ms in the 10 ms task
+static uint16_t dcswDelay = DCSW_DELAY;
+static bool dcswCommanded = false;
+static const uint16_t HVACTIVE_DELAY = 1; // 10 ms after DCSW is set
+static uint16_t hvactiveDelay = HVACTIVE_DELAY;
+static bool hvactiveCommanded = false;
+static const uint16_t COOLANT_PUMP_DELAY = 25; // 250 ms after HVACTIVE is set
+static uint16_t coolantPumpDelay = COOLANT_PUMP_DELAY;
+static const uint16_t PRECHARGE_FAIL_NEG_DELAY = 5; // 50 ms in the 10 ms task
+static uint16_t prechargeFailNegDelay = PRECHARGE_FAIL_NEG_DELAY;
 
 // Instantiate Classes
 static BMW_E31 e31Vehicle;
@@ -219,9 +248,74 @@ static Compressor *selectedCompressor = &UnUsed;
 static PWMHeater pwmHeater;
 static Maintainer12V maintainer12V;
 
+static PersistentAcSessionState ReadPersistentAcSessionState() {
+  switch ((uint16_t)BKP_DR1) {
+  case AC_SESSION_ACTIVE:
+    return AC_SESSION_ACTIVE;
+  case AC_SESSION_LOCKED_PLUGGED:
+    return AC_SESSION_LOCKED_PLUGGED;
+  case AC_SESSION_LOCKED_UNPLUGGED:
+    return AC_SESSION_LOCKED_UNPLUGGED;
+  default:
+    return AC_SESSION_IDLE;
+  }
+}
+
+static void SetPersistentAcSessionState(PersistentAcSessionState state) {
+  if (persistentAcSessionState == state)
+    return;
+
+  // rtc_setup() enables write access to the backup domain. A single register
+  // write is used so a brownout cannot leave a multi-register record halfway
+  // updated.
+  BKP_DR1 = state;
+  persistentAcSessionState = state;
+}
+
+static void RestorePersistentAcSessionState() {
+  const bool proxPilotConfigured =
+      Param::GetInt(Param::GPA1Func) == IOMatrix::PILOT_PROX ||
+      Param::GetInt(Param::GPA2Func) == IOMatrix::PILOT_PROX;
+
+  persistentAcSessionState = ReadPersistentAcSessionState();
+
+  if (!proxPilotConfigured) {
+    // This restart protection can only be re-armed by a physical PP cycle.
+    // Do not retain it on configurations without a proximity-pilot input.
+    SetPersistentAcSessionState(AC_SESSION_IDLE);
+    return;
+  }
+
+  if (persistentAcSessionState != AC_SESSION_IDLE) {
+    ChgLck = true;
+    RunACChg = false;
+
+    // If unplug had already been confirmed before the reset, a fresh plugged
+    // reading represents the required new plug-in and may clear the lock.
+    ppUnplugConfirmed =
+        persistentAcSessionState == AC_SESSION_LOCKED_UNPLUGGED;
+  }
+}
+
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 static void Ms200Task(void) {
   int opmode = Param::GetInt(Param::opmode);
+  const bool proxPilotConfigured =
+      Param::GetInt(Param::GPA1Func) == IOMatrix::PILOT_PROX ||
+      Param::GetInt(Param::GPA2Func) == IOMatrix::PILOT_PROX;
+
+  // Remember that this AC request made it all the way into charge mode. If
+  // another part of the state machine forces it out while the request remains
+  // asserted, latch the completed/aborted session before it can precharge
+  // again.
+  if (acSessionActive && opmode == MOD_CHARGE && !chargeModeDC)
+    acChargeStateSeen = true;
+  if (acChargeStateSeen && opmode != MOD_CHARGE) {
+    RunACChg = false;
+    ChgLck = true;
+    if (proxPilotConfigured)
+      SetPersistentAcSessionState(AC_SESSION_LOCKED_PLUGGED);
+  }
 
   selectedVehicle->Task200Ms();
   if (opmode == MOD_CHARGE)
@@ -250,7 +344,7 @@ static void Ms200Task(void) {
   Param::SetInt(Param::uptime, rtc_get_counter_val());
   Param::SetInt(Param::ChgT, ChgDur_tmp);
 
-  // Setting of RunChg - main okay to charge param
+  // Set independent AC and DC charge permissions.
 
   if (ChgSet == 2 && !ChgLck) // if in timer mode and not locked out from a
                               // previous full charge.
@@ -258,20 +352,20 @@ static void Ms200Task(void) {
     if (opmode != MOD_CHARGE) {
       if ((ChgHrs_tmp == hours) && (ChgMins_tmp == minutes) &&
           (ChgDur_tmp != 0))
-        RunChg = true; // if we arrive at set charge time and duration is non
-                       // zero then initiate charge
+        RunACChg = true; // if we arrive at set charge time and duration is
+                         // non-zero, allow AC charging
       else
-        RunChg = false;
+        RunACChg = false;
     }
 
-    if (opmode == MOD_CHARGE) {
+    if (opmode == MOD_CHARGE && !chargeModeDC) {
       if (ChgTicks != 0) {
         ChgTicks--; // decrement charge timer ticks
         ChgTicks_1Min++;
       }
 
       if (ChgTicks == 0) {
-        RunChg = false; // end charge if still charging once timer expires.
+        RunACChg = false; // end AC charge if still charging when timer expires
         ChgTicks = (GetInt(Param::Chg_Dur) * 300); // recharge the tick timer
       }
 
@@ -282,36 +376,105 @@ static void Ms200Task(void) {
     }
   }
   if (ChgSet == 0 && !ChgLck)
-    RunChg = true; // enable from webui if we are not locked out from an auto
-                   // termination
+    RunACChg = true; // enable AC charging from webui if we are not locked out
+                     // from an automatic termination
   if (ChgSet == 1)
-    RunChg = false; // disable from webui
+    RunACChg = false; // disable AC charging from webui
 
-  // Handle PP on the Charging port - Changes RunChg
-  if (Param::GetInt(Param::GPA1Func) == IOMatrix::PILOT_PROX ||
-      Param::GetInt(Param::GPA2Func) == IOMatrix::PILOT_PROX) {
+  // Handle PP on the charging port. Proximity pilot only controls AC charging.
+  if (proxPilotConfigured) {
     int ppThresh = Param::GetInt(Param::ppthresh);
     int ppValue = IOMatrix::GetAnaloguePin(IOMatrix::PILOT_PROX)->Get();
     Param::SetInt(Param::PPVal, ppValue);
 
-    // If PP is at or below threshold and currently disabled and not already
-    // finished
+    // Re-arm a completed AC session only after PP has continuously reported
+    // unplugged, followed by a new plug-in. This prevents a PP transient while
+    // the EVSE or OBC is shutting down from clearing the completion latch.
     if (ppValue <= ppThresh) {
+      if (ChgLck && ppUnplugConfirmed) {
+        ChgLck = false;
+        acSessionActive = false;
+        acChargeStateSeen = false;
+        SetPersistentAcSessionState(AC_SESSION_IDLE);
+      }
+      ppUnplugTicks = 0;
+      ppUnplugConfirmed = false;
+
       if (ChgSet == 1 && !ChgLck) {
-        RunChg = true;
+        RunACChg = true;
       }
       Param::SetInt(Param::PlugDet, 1);
     } else if (ppValue > ppThresh) {
-      // even if timer was enabled, change to disabled, we've unplugged
-      RunChg = false;
+      // Stop immediately on a possible unplug, but do not clear ChgLck until
+      // the unplug has been confirmed and a subsequent plug-in is observed.
+      RunACChg = false;
       Param::SetInt(Param::PlugDet, 0);
+
+      if (ChgLck) {
+        if (ppUnplugTicks < PP_UNPLUG_CONFIRM_TICKS)
+          ppUnplugTicks++;
+        if (ppUnplugTicks >= PP_UNPLUG_CONFIRM_TICKS) {
+          ppUnplugConfirmed = true;
+          acSessionActive = false;
+          acChargeStateSeen = false;
+          SetPersistentAcSessionState(AC_SESSION_LOCKED_UNPLUGGED);
+        }
+      } else {
+        ppUnplugTicks = 0;
+        ppUnplugConfirmed = false;
+      }
     }
   }
-  // END Setting of RunChg - main okay to charge param
+
+  ///////////////////////////////////////
+  // Charge termination logic for AC charge
+  ///////////////////////////////////////
+  /*
+  If we are in AC charge mode and battV >= setpoint and current is <= the
+  termination setpoint, end charge and require an unplug before another AC
+  session. The BMS may also terminate AC charging by commanding 0A.
+  */
+  if (opmode == MOD_CHARGE && !chargeModeDC) {
+    if (Param::GetInt(Param::udc) >= Param::GetInt(Param::Voltspnt) &&
+        Param::GetInt(Param::idc) <= Param::GetInt(Param::IdcTerm)) {
+      RunACChg = false;
+      ChgLck = true;
+      if (proxPilotConfigured)
+        SetPersistentAcSessionState(AC_SESSION_LOCKED_PLUGGED);
+    }
+
+    if (selectedBMS->MaxChargeCurrent() == 0) {
+      RunACChg = false;
+      ChgLck = true;
+      if (proxPilotConfigured)
+        SetPersistentAcSessionState(AC_SESSION_LOCKED_PLUGGED);
+    }
+  }
+
+  // A completed AC charge remains inhibited while the cable is connected.
+  if (ChgLck)
+    RunACChg = false;
+
+  // END setting of AC and DC charge permissions
 
   // Check if we want to AC charge via charger
-  if (selectedCharger->ControlCharge(RunChg, ACrequest) &&
-      (opmode != MOD_RUN)) {
+  bool acChargeRequested =
+      selectedCharger->ControlCharge(RunACChg && !ChgLck, ACrequest);
+
+  // Also latch an AC session that the charger, EVSE, or PP signal ends before
+  // the generic voltage/current termination test catches it. A real unplug
+  // confirms and re-arms the latch separately; it must not bypass the latch.
+  if (acSessionActive && !acChargeRequested && opmode != MOD_RUN) {
+    RunACChg = false;
+    ChgLck = true;
+    if (proxPilotConfigured)
+      SetPersistentAcSessionState(AC_SESSION_LOCKED_PLUGGED);
+  }
+
+  if (!ChgLck && acChargeRequested && (opmode != MOD_RUN)) {
+    acSessionActive = true;
+    if (proxPilotConfigured)
+      SetPersistentAcSessionState(AC_SESSION_ACTIVE);
     chargeMode = true; // AC charge mode
     Param::SetInt(Param::chgtyp, AC);
   } else if (!chargeModeDC) {
@@ -320,31 +483,15 @@ static void Ms200Task(void) {
   }
   // end check
 
-  ///////////////////////////////////////
-  // Charge term logic for AC charge
-  ///////////////////////////////////////
-  /*
-  if we are in charge mode and battV >= setpoint and power is <= termination
-  setpoint Then we end charge.
-  */
-  if (opmode == MOD_CHARGE && !chargeModeDC) {
-    if (Param::GetInt(Param::udc) >= Param::GetInt(Param::Voltspnt) &&
-        Param::GetInt(Param::idc) <= Param::GetInt(Param::IdcTerm)) {
-      RunChg = false; // end charge
-      ChgLck = true;  // set charge lockout flag
-    }
-
-    if (selectedBMS->MaxChargeCurrent() ==
-        0) // BMS can command an AC charge shutdown if its current limit is 0
-    {
-      RunChg = false; // end charge
-      ChgLck = true;  // set charge lockout flag
-    }
-  }
-  // End Charge Term Logic
-
   if (opmode == MOD_RUN) {
-    ChgLck = false; // reset charge lockout flag when we drive off
+    // Preserve the legacy reset for installations without proximity pilot.
+    // With PP configured, only a confirmed physical unplug clears ChgLck.
+    if (!proxPilotConfigured) {
+      ChgLck = false;
+      acSessionActive = false;
+      acChargeStateSeen = false;
+      SetPersistentAcSessionState(AC_SESSION_IDLE);
+    }
 
     selectedCompressor->Task200Ms();
 
@@ -386,6 +533,7 @@ static void Ms200Task(void) {
 static void Ms100Task(void) {
   DigIo::led_out.Toggle();
   iwdg_reset();
+  utils::MeasurementWatchdogTask100Ms();
   float cpuLoad = scheduler->GetCpuLoad() / 10.0f;
   Param::SetFloat(Param::cpuload, cpuLoad);
   Param::SetInt(Param::lasterr, ErrorMessage::GetLastError());
@@ -467,8 +615,8 @@ static void Ms100Task(void) {
         ->Task100Ms(); // send the 100ms task request for the lim all the time
                        // and for others if in DC charge mode
 
-  if (selectedChargeInt->DCFCRequest(RunChg) ||
-      ExtHVreq) // Request to run dc fast charge via charge interface or
+  if (selectedChargeInt->DCFCRequest(RunDCChg) ||
+      (RunDCChg && ExtHVreq)) // Request to run dc fast charge via charge interface or
                 // external pin io
   {
     // Here we receive a valid DCFC startup request.
@@ -485,7 +633,7 @@ static void Ms100Task(void) {
                      // if we are NOT in DC charge mode.
   {
     ACrequest = selectedChargeInt->ACRequest(
-        RunChg); // If using unused always returns true
+        RunACChg); // If using unused always returns true
   }
   // End charge interface logic
 
@@ -579,13 +727,6 @@ static void Ms100Task(void) {
     IOMatrix::GetPin(IOMatrix::COOLINGFAN)->Clear(); // Coolant Fan Off
   }
 
-  // HV Active output
-  if (opmode == MOD_CHARGE || opmode == MOD_RUN || opmode == MOD_PREHEAT) {
-    IOMatrix::GetPin(IOMatrix::HVACTIVE)->Set(); // HV Active On
-  } else {
-    IOMatrix::GetPin(IOMatrix::HVACTIVE)->Clear(); // HV Active Off
-  }
-
   // ShiftLock Out output
   if (opmode == MOD_RUN && Param::GetInt(Param::ShiftLock) == 1) {
     IOMatrix::GetPin(IOMatrix::SHIFTLOCKNO)->Set(); // Shift Lock Out On
@@ -610,6 +751,22 @@ static void ControlCabHeater(int opmode) {
         ->Clear(); // Disable heater and coolant pump
     selectedHeater->SetPower(0, 0);
   }
+}
+
+static void ClearPrechargeFailAuxOutputs() {
+  IOMatrix::GetPin(IOMatrix::COOLANTPUMP)->Clear();
+  IOMatrix::GetPin(IOMatrix::COOLINGFAN)->Clear();
+  IOMatrix::GetPin(IOMatrix::RUNINDICATION)->Clear();
+  IOMatrix::GetPin(IOMatrix::SHIFTLOCKNO)->Clear();
+  IOMatrix::GetPin(IOMatrix::PREHEATOUT)->Clear();
+  IOMatrix::GetPin(IOMatrix::BRAKEVACPUMP)->Clear();
+  IOMatrix::GetPin(IOMatrix::HEATERENABLE)->Clear();
+  IOMatrix::GetPin(IOMatrix::HVACTIVE)->Clear();
+}
+
+static void ClearPrechargeFailLoads() {
+  ClearPrechargeFailAuxOutputs();
+  DigIo::inv_out.Clear();
 }
 
 static void Ms10Task(void) {
@@ -711,6 +868,18 @@ static void Ms10Task(void) {
   stt |= udc < Param::GetFloat(Param::udclim) ? STAT_NONE : STAT_UDCLIM;
   Param::SetInt(Param::status, stt);
 
+  bool prechargeRequestActive =
+      (StartSig || chargeMode || preheater.GetRunPreHeat() ||
+       maintainer12V.GetRunMaintainer()) &&
+      (!initbyStart || selectedVehicle->Ready()) &&
+      (!initbyCharge || chargeMode) &&
+      (!preheater.GetInitByPreHeat() || preheater.GetRunPreHeat()) &&
+      (!maintainer12V.GetInitByMaintainer() ||
+       maintainer12V.GetRunMaintainer());
+  bool prechargeValid =
+      (prechargeMinTime == 0) &&
+      (stt & (STAT_POTPRESSED | STAT_UDCBELOWUDCSW | STAT_UDCLIM)) == 0;
+
   switch (opmode) {
   case MOD_OFF:
     initbyStart = false;
@@ -718,9 +887,16 @@ static void Ms10Task(void) {
     preheater.SetInitByPreHeat(false);
     maintainer12V.SetInitByMaintainer(false);
 
-    DigIo::inv_out.Clear();                           // inverter power off
+    DigIo::inv_out.Clear();                              // inverter power off
     IOMatrix::GetPin(IOMatrix::COOLANTPUMP)->Clear(); // Coolant pump off if
-                                                      // used
+                                                         // used
+    IOMatrix::GetPin(IOMatrix::HVACTIVE)->Clear();
+    dcswDelay = DCSW_DELAY;
+    dcswCommanded = false;
+    hvactiveDelay = HVACTIVE_DELAY;
+    hvactiveCommanded = false;
+    coolantPumpDelay = COOLANT_PUMP_DELAY;
+    prechargeFailNegDelay = PRECHARGE_FAIL_NEG_DELAY;
     Param::SetInt(
         Param::dir,
         0); // shift to park/neutral on shutdown regardless of shifter pos
@@ -778,14 +954,16 @@ static void Ms10Task(void) {
       if (selectedInverter != &openInv)
         DigIo::inv_out.Set(); // inverter power on but not if we are in charge
                               // mode and not if OI
-    } else if ((Param::GetInt(Param::ShuntType) == 0) &&
-               selectedInverter == &leafInv) // Shunt 0 + Leaf is precharge
-                                             // using leaf inverter voltage
-    {
-      DigIo::inv_out.Set(); // inverter power on
+    } else if (((Param::GetInt(Param::ShuntType) == 0) &&
+                selectedInverter == &leafInv) ||
+               ((Param::GetInt(Param::ShuntType) == 1 ||
+                 Param::GetInt(Param::ShuntType) == 4) &&
+                selectedInverter != &openInv)) {
+      // Keep IGN on while charging when an ISA shunt is selected, except when
+      // OpenInverter is selected. Shunt 0 + Leaf still uses inverter voltage.
+      DigIo::inv_out.Set();
     }
     IOMatrix::GetPin(IOMatrix::NEGCONTACTOR)->Set();
-    IOMatrix::GetPin(IOMatrix::COOLANTPUMP)->Set();
     if (rlyDly != 0)
       rlyDly--; // here we are going to pause before energising precharge to
                 // prevent too many contactors pulling amps at the same time
@@ -793,30 +971,65 @@ static void Ms10Task(void) {
       DigIo::prec_out.Set(); // commence precharge
     if (prechargeMinTime != 0)
       prechargeMinTime--; // 1 second minimum precharge time
-    if ((prechargeMinTime == 0) &&
-        (stt & (STAT_POTPRESSED | STAT_UDCBELOWUDCSW | STAT_UDCLIM)) ==
-            0) // Clarify operator precedence, exit precharge: time met and no
-               // faults
-    {
-      if (StartSig) {
-        opmode = MOD_RUN;
-        StartSig = false;                    // reset for next time
-        rlyDly = 25;                         // Recharge sequence timer
+    if (!prechargeValid || !prechargeRequestActive) {
+      dcswDelay = DCSW_DELAY;
+      dcswCommanded = false;
+      hvactiveDelay = HVACTIVE_DELAY;
+      hvactiveCommanded = false;
+      coolantPumpDelay = COOLANT_PUMP_DELAY;
+      ClearPrechargeFailAuxOutputs();
+      DigIo::dcsw_out.Clear();
+    } else if (!dcswCommanded) {
+      DigIo::dcsw_out.Clear();
+      IOMatrix::GetPin(IOMatrix::HVACTIVE)->Clear();
+      IOMatrix::GetPin(IOMatrix::COOLANTPUMP)->Clear();
+
+      if (dcswDelay != 0)
+        dcswDelay--; // Keep precharge valid for 250 ms before setting DCSW.
+
+      if (dcswDelay == 0) {
+        DigIo::dcsw_out.Set();
+        dcswCommanded = true;
+        hvactiveDelay = HVACTIVE_DELAY;
+      }
+    } else if (!hvactiveCommanded) {
+      DigIo::dcsw_out.Set();
+      IOMatrix::GetPin(IOMatrix::HVACTIVE)->Clear();
+      IOMatrix::GetPin(IOMatrix::COOLANTPUMP)->Clear();
+
+      if (hvactiveDelay != 0)
+        hvactiveDelay--; // DCSW must be on for 10 ms before HVACTIVE.
+
+      if (hvactiveDelay == 0) {
+        IOMatrix::GetPin(IOMatrix::HVACTIVE)->Set();
+        hvactiveCommanded = true;
+        coolantPumpDelay = COOLANT_PUMP_DELAY;
+      }
+    } else {
+      DigIo::dcsw_out.Set();
+      IOMatrix::GetPin(IOMatrix::HVACTIVE)->Set();
+
+      if (coolantPumpDelay != 0)
+        coolantPumpDelay--;
+
+      if (coolantPumpDelay == 0) {
+        IOMatrix::GetPin(IOMatrix::COOLANTPUMP)->Set();
+
+        if (StartSig) {
+          opmode = MOD_RUN;
+          StartSig = false; // reset for next time
+        } else if (chargeMode) {
+          opmode = MOD_CHARGE;
+        } else if (preheater.GetRunPreHeat()) {
+          opmode = MOD_PREHEAT;
+        } else if (maintainer12V.GetRunMaintainer()) {
+          opmode = MOD_MAINTAIN;
+          Param::SetInt(Param::maintainWakeups,
+                        Param::GetInt(Param::maintainWakeups) + 1);
+        }
         Param::SetInt(Param::TorqDerate, 0); // clear torque derate reason
-      } else if (chargeMode) {
-        opmode = MOD_CHARGE;
-        rlyDly = 25;                         // Recharge sequence timer
-        Param::SetInt(Param::TorqDerate, 0); // clear torque derate reason
-      } else if (preheater.GetRunPreHeat()) {
-        opmode = MOD_PREHEAT;
-        rlyDly = 25;                         // Recharge sequence timer
-        Param::SetInt(Param::TorqDerate, 0); // clear torque derate reason
-      } else if (maintainer12V.GetRunMaintainer()) {
-        opmode = MOD_MAINTAIN;
-        rlyDly = 25;                         // Recharge sequence timer
-        Param::SetInt(Param::TorqDerate, 0); // clear torque derate reason
-        Param::SetInt(Param::maintainWakeups,
-                      Param::GetInt(Param::maintainWakeups) + 1);
+      } else {
+        IOMatrix::GetPin(IOMatrix::COOLANTPUMP)->Clear();
       }
     }
     if (initbyCharge && !chargeMode)
@@ -832,70 +1045,71 @@ static void Ms10Task(void) {
 
     if (udc < (Param::GetInt(Param::udcsw)) &&
         rtc_get_counter_val() > (vehicleStartTime + PRECHARGE_TIMEOUT)) {
+      ClearPrechargeFailLoads();
+      DigIo::dcsw_out.Clear();
       DigIo::prec_out.Clear();
+      prechargeFailNegDelay = PRECHARGE_FAIL_NEG_DELAY;
       ErrorMessage::Post(ERR_PRECHARGE);
       opmode = MOD_PCHFAIL;
     }
     Param::SetInt(Param::opmode, opmode);
     break;
 
-  case MOD_PCHFAIL:
+  case MOD_PCHFAIL: {
     StartSig = false;
-    DigIo::prec_out
-        .Clear(); // explicitly turn off precharge relay in a fail condition
-    if (initbyCharge && !chargeMode)
-      opmode = MOD_OFF; // only go to off if the signal from charge or vehicle
-                        // start is removed
-    if (initbyStart && !selectedVehicle->Ready())
-      opmode = MOD_OFF; // this avoids oscillation in the event of a precharge
-                        // system failure
+    ClearPrechargeFailLoads();
+    dcswDelay = DCSW_DELAY;
+    dcswCommanded = false;
+    hvactiveDelay = HVACTIVE_DELAY;
+    hvactiveCommanded = false;
+    coolantPumpDelay = COOLANT_PUMP_DELAY;
+    DigIo::dcsw_out.Clear();
+    DigIo::prec_out.Clear();
+
+    if (prechargeFailNegDelay != 0)
+      prechargeFailNegDelay--;
+
+    if (prechargeFailNegDelay == 0)
+      IOMatrix::GetPin(IOMatrix::NEGCONTACTOR)->Clear();
+
+    bool prechargeFailRequestReleased =
+        (initbyCharge && !chargeMode) ||
+        (initbyStart && !selectedVehicle->Ready()) ||
+        (preheater.GetInitByPreHeat() && !preheater.GetRunPreHeat()) ||
+        (maintainer12V.GetInitByMaintainer() &&
+         !maintainer12V.GetRunMaintainer());
+
+    if (prechargeFailNegDelay == 0 && prechargeFailRequestReleased)
+      opmode = MOD_OFF;
     Param::SetInt(Param::opmode, opmode);
     break;
+  }
 
   case MOD_CHARGE:
-    if (rlyDly != 0)
-      rlyDly--; // here we are going to pause before energising precharge to
-                // prevent too many contactors pulling amps at the same time
-    if (rlyDly == 0) {
-      DigIo::dcsw_out.Set();
-    }
     ErrorMessage::UnpostAll();
     if (!chargeMode) {
       opmode = MOD_OFF;
-      rlyDly = 250; // Recharge sequence timer for delayed shutdown
+      rlyDly = 300; // Recharge sequence timer for delayed shutdown
     }
     Param::SetInt(Param::opmode, opmode);
     break;
 
   case MOD_RUN:
-    if (rlyDly != 0)
-      rlyDly--; // here we are going to pause before energising precharge to
-                // prevent too many contactors pulling amps at the same time
-    if (rlyDly == 0) {
-      DigIo::dcsw_out.Set();
-      DigIo::inv_out.Set(); // inverter power on
-    }
+    DigIo::inv_out.Set(); // inverter power on
     Param::SetInt(Param::opmode, MOD_RUN);
     ErrorMessage::UnpostAll();
     if (!selectedVehicle->Ready()) {
       opmode = MOD_OFF;
-      rlyDly = 250; // Recharge sequence timer for delayed shutdown
+      rlyDly = 300; // Recharge sequence timer for delayed shutdown
     }
     Param::SetInt(Param::opmode, opmode);
     break;
 
   case MOD_MAINTAIN:
-    if (rlyDly != 0)
-      rlyDly--; // here we are going to pause before energising precharge to
-                // prevent too many contactors pulling amps at the same time
-    if (rlyDly == 0) {
-      DigIo::dcsw_out.Set();
-    }
-
     maintainer12V.Ms10Task();
 
     if (!maintainer12V.GetRunMaintainer()) {
-      rlyDly = 250; // Recharge sequence timer for delayed shutdown
+      rlyDly = 300; // Recharge sequence timer for delayed shutdown
     }
 
     if ((selectedVehicle->Start() && selectedVehicle->Ready())) {
@@ -905,17 +1119,10 @@ static void Ms10Task(void) {
     break;
 
   case MOD_PREHEAT:
-    if (rlyDly != 0)
-      rlyDly--; // here we are going to pause before energising precharge to
-                // prevent too many contactors pulling amps at the same time
-    if (rlyDly == 0) {
-      DigIo::dcsw_out.Set();
-    }
-
     preheater.Ms10Task();
 
     if (!preheater.GetRunPreHeat()) {
-      rlyDly = 250; // Recharge sequence timer for delayed shutdown
+      rlyDly = 300; // Recharge sequence timer for delayed shutdown
     }
     break;
   }
@@ -923,11 +1130,12 @@ static void Ms10Task(void) {
   ControlCabHeater(opmode);
   if (Param::GetInt(Param::ShuntType) == 2)
     SBOX::ControlContactors(
-        opmode,
+        opmode, dcswCommanded,
         canInterface[Param::GetInt(Param::ShuntCan)]); // BMW contactor box
+
   if (Param::GetInt(Param::ShuntType) == 3)
     VWBOX::ControlContactors(
-        opmode,
+        opmode, dcswCommanded,
         canInterface[Param::GetInt(Param::ShuntCan)]); // VW contactor box
 }
 
@@ -1479,6 +1687,7 @@ int main(void) {
   usart2_setup(); // TOYOTA HYBRID INVERTER INTERFACE
   nvic_setup();
   parm_load();
+  RestorePersistentAcSessionState();
   spi2_setup();
   spi3_setup();
   tim3_setup(); // For general purpose PWM output

@@ -14,6 +14,7 @@
 #include "my_math.h"
 #include "params.h"
 #include "stm32_can.h"
+#include "utils.h"
 #include <isa_shunt.h>
 
 uint16_t framecount = 0;
@@ -211,6 +212,7 @@ void ISA::handle521(uint32_t data[2]) // Amperes
                        // See comments are useful:)
   Amperes =
       ((bytes[5] << 24) | (bytes[4] << 16) | (bytes[3] << 8) | (bytes[2]));
+  utils::IdcReceived(utils::MEASUREMENT_ISA);
 }
 
 void ISA::handle522(uint32_t data[2]) // Voltage
@@ -221,6 +223,7 @@ void ISA::handle522(uint32_t data[2]) // Voltage
                        // See comments are useful:)
   Voltage =
       ((bytes[5] << 24) | (bytes[4] << 16) | (bytes[3] << 8) | (bytes[2]));
+  utils::UdcReceived(utils::MEASUREMENT_ISA);
 }
 
 void ISA::handle523(uint32_t data[2]) // Voltage2

@@ -35,10 +35,82 @@ namespace utils {
 
 #define CAN_TIMEOUT 1 // 1000ms
 
+// Current and voltage sources used by the watchdog normally update much
+// faster than this. Five 100ms ticks allows short CAN timing jitter without
+// accepting an old measurement indefinitely.
+static const uint8_t MEASUREMENT_TIMEOUT_TICKS = 5;
+static volatile uint8_t idcAge[MEASUREMENT_SOURCE_COUNT] = {
+    MEASUREMENT_TIMEOUT_TICKS, MEASUREMENT_TIMEOUT_TICKS,
+    MEASUREMENT_TIMEOUT_TICKS, MEASUREMENT_TIMEOUT_TICKS};
+static volatile uint8_t udcAge[MEASUREMENT_SOURCE_COUNT] = {
+    MEASUREMENT_TIMEOUT_TICKS, MEASUREMENT_TIMEOUT_TICKS,
+    MEASUREMENT_TIMEOUT_TICKS, MEASUREMENT_TIMEOUT_TICKS};
+
 float SOCVal = 0;
 int32_t NetWh = 0;
 
 bool Timer1Run = false;
+
+static int GetSelectedIdcSource() {
+  switch (Param::GetInt(Param::ShuntType)) {
+  case 1:
+  case 4:
+    return MEASUREMENT_ISA;
+  case 2:
+    return MEASUREMENT_BMW_SBOX;
+  case 3:
+    return MEASUREMENT_VAG_SBOX;
+  default:
+    return -1;
+  }
+}
+
+static int GetSelectedUdcSource() {
+  switch (Param::GetInt(Param::ShuntType)) {
+  case 1:
+  case 4:
+    return MEASUREMENT_ISA;
+  case 2:
+    return MEASUREMENT_BMW_SBOX;
+  case 3:
+    return MEASUREMENT_VAG_SBOX;
+  default:
+    return Param::GetInt(Param::Inverter) == InvModes::Leaf_Gen1
+               ? MEASUREMENT_LEAF_INVERTER
+               : -1;
+  }
+}
+
+float GetIdc() { return Param::GetFloat(Param::idc); }
+
+bool IdcAvailable() { return GetSelectedIdcSource() >= 0; }
+
+bool IdcFresh() {
+  int source = GetSelectedIdcSource();
+  return source >= 0 && idcAge[source] < MEASUREMENT_TIMEOUT_TICKS;
+}
+
+float GetUdc() { return Param::GetFloat(Param::udc); }
+
+bool UdcAvailable() { return GetSelectedUdcSource() >= 0; }
+
+bool UdcFresh() {
+  int source = GetSelectedUdcSource();
+  return source >= 0 && udcAge[source] < MEASUREMENT_TIMEOUT_TICKS;
+}
+
+void IdcReceived(MeasurementSource source) { idcAge[source] = 0; }
+
+void UdcReceived(MeasurementSource source) { udcAge[source] = 0; }
+
+void MeasurementWatchdogTask100Ms() {
+  for (int source = 0; source < MEASUREMENT_SOURCE_COUNT; source++) {
+    if (idcAge[source] < MEASUREMENT_TIMEOUT_TICKS)
+      idcAge[source]++;
+    if (udcAge[source] < MEASUREMENT_TIMEOUT_TICKS)
+      udcAge[source]++;
+  }
+}
 
 void PostErrorIfRunning(ERROR_MESSAGE_NUM err) {
   if (Param::GetInt(Param::opmode) == MOD_RUN) {
@@ -340,7 +412,7 @@ void SelectDirection(Vehicle *vehicle, Shifter *shifter) {
 }
 
 float ProcessUdc(int motorSpeed) {
-  float udc = Param::GetFloat(Param::udc);
+  float udc = GetUdc();
 
   if (Param::GetInt(Param::ShuntType) == 0 &&
       Param::GetInt(Param::BMS_Mode) != BMSSTW) {
@@ -352,7 +424,7 @@ float ProcessUdc(int motorSpeed) {
   } else if (Param::GetInt(Param::ShuntType) == 1 ||
              Param::GetInt(Param::ShuntType) == 4) // ISA shunt
   {
-    float udc =
+    udc =
         ((float)ISA::Voltage) /
         1000; // get voltage from isa sensor and post to parameter database
     Param::SetFloat(Param::udc, udc);
@@ -392,7 +464,7 @@ float ProcessUdc(int motorSpeed) {
   } else if (Param::GetInt(Param::ShuntType) == 2) // BMS Sbox
   {
     if (Param::GetInt(Param::opmode) != MOD_OFF) {
-      float udc =
+      udc =
           ((float)SBOX::Voltage2) / 1000; // get output voltage from sbox sensor
                                           // and post to parameter database
       Param::SetFloat(Param::udc, udc);
@@ -408,6 +480,7 @@ float ProcessUdc(int motorSpeed) {
                         udc2 - 20); // Set udcsw to 20V under battery voltage
       }
     } else {
+      udc = 0;
       Param::SetFloat(Param::udc, 0);
       Param::SetFloat(Param::udc2, 0);
     }
@@ -424,7 +497,7 @@ float ProcessUdc(int motorSpeed) {
   } else if (Param::GetInt(Param::ShuntType) == 3) // VW
   {
     if (Param::GetInt(Param::opmode) != MOD_OFF) {
-      float udc =
+      udc =
           ((float)VWBOX::Voltage) * 0.5; // get output voltage from sbox sensor
                                          // and post to parameter database
       Param::SetFloat(Param::udc, udc);
@@ -440,6 +513,7 @@ float ProcessUdc(int motorSpeed) {
                         udc2 - 20); // Set udcsw to 20V under battery voltage
       }
     } else {
+      udc = 0;
       Param::SetFloat(Param::udc, 0);
       Param::SetFloat(Param::udc2, 0);
     }

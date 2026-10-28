@@ -68,6 +68,7 @@ void LeafINV::DecodeCAN(int id, uint32_t data[2]) {
             420) // Only populate if no shunt is used and voltage is under 420
     {
       Param::SetFloat(Param::udc, voltage);
+      utils::UdcReceived(utils::MEASUREMENT_LEAF_INVERTER);
     }
 
     int16_t parsed_speed = (bytes[4] << 7) | bytes[5] >> 1;

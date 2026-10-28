@@ -20,6 +20,7 @@
  */
 
 #include "bmw_sbox.h"
+#include "utils.h"
 
 /*
  * Implements control of the contactors in the BMW PHEV battery box "SBOX" unit.
@@ -102,6 +103,7 @@ void SBOX::handle200(uint32_t data[2]) // SBOX Current
   Amperes = ((bytes[2] << 16) | (bytes[1] << 8) | (bytes[0]));
   Amperes = (Amperes << 8) >> 8; // extend sign bit as its a 24 bit signed value
                                  // in a 32bit int! AAAHHHHHH!
+  utils::IdcReceived(utils::MEASUREMENT_BMW_SBOX);
 }
 
 void SBOX::handle210(uint32_t data[2]) // SBOX battery voltage
@@ -133,10 +135,12 @@ void SBOX::handle220(uint32_t data[2]) // SBOX Output voltage
   if (tmpvolt2 < 600000) // Ignore start up values that are none plausible
   {
     Voltage2 = tmpvolt2;
+    utils::UdcReceived(utils::MEASUREMENT_BMW_SBOX);
   }
 }
 
-void SBOX::ControlContactors(int opmode, CanHardware *can) {
+void SBOX::ControlContactors(int opmode, bool prechargeComplete,
+                            CanHardware *can) {
   uint8_t bytes[8];
   bytes[0] = 0xFF; // sems to control the iso relay
   bytes[1] = 0xFE; // needs to be 0xFE to enable contactors.
@@ -161,15 +165,16 @@ void SBOX::ControlContactors(int opmode, CanHardware *can) {
   case 0:
     CCByte = 0x00; // all contactors off
     break;
-  case 2:          // Precharge
-    CCByte = 0xA6; // Prech and Neg contactors activated
+  case 2: // Precharge
+    CCByte = prechargeComplete
+                 ? 0xAA  // Successful precharge: all contactors activated
+                 : 0xA6; // Precharge and negative contactors activated
     break;
 
   case 1:          // Run
-    CCByte = 0xAA; // All contactors activated
-    break;
-
   case 4:          // Charge
+  case 5:          // Maintain
+  case 6:          // Preheat
     CCByte = 0xAA; // All contactors activated
     break;
 
