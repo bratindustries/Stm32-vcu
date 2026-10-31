@@ -174,12 +174,12 @@ static bool HVILok = 0;
 static volatile unsigned days = 0, hours = 0, minutes = 0, seconds = 0,
                          alarm = 0; // != 0 when alarm is pending
 
-static uint16_t rlyDly = 25;
-static uint16_t prechargeMinTime = 100;
-static const uint16_t DCSW_DELAY = 25; // 250 ms in the 10 ms task
+static const uint16_t PRECHARGE_RELAY_DELAY = 10; // 100 ms in the 10 ms task
+static uint16_t rlyDly = PRECHARGE_RELAY_DELAY;
+static const uint16_t DCSW_DELAY = 50; // 500 ms in the 10 ms task
 static uint16_t dcswDelay = DCSW_DELAY;
 static bool dcswCommanded = false;
-static const uint16_t HVACTIVE_DELAY = 1; // 10 ms after DCSW is set
+static const uint16_t HVACTIVE_DELAY = 5; // 50 ms after DCSW is set
 static uint16_t hvactiveDelay = HVACTIVE_DELAY;
 static bool hvactiveCommanded = false;
 static const uint16_t COOLANT_PUMP_DELAY = 25; // 250 ms after HVACTIVE is set
@@ -927,7 +927,6 @@ static void Ms10Task(void) {
       (!maintainer12V.GetInitByMaintainer() ||
        maintainer12V.GetRunMaintainer());
   bool prechargeValid =
-      (prechargeMinTime == 0) &&
       (stt & (STAT_POTPRESSED | STAT_UDCBELOWUDCSW | STAT_UDCLIM)) == 0;
 
   switch (opmode) {
@@ -973,33 +972,33 @@ static void Ms10Task(void) {
         opmode = MOD_PRECHARGE; // proceed to precharge if 1)throttle not
                                 // pressed , 2)ign on , 3)start signal rx, 4) HV
                                 // IL input is grounded if selected.
-        rlyDly = 25;            // Recharge sequence timer
+        rlyDly = PRECHARGE_RELAY_DELAY; // Delay before precharge relay closes
         vehicleStartTime = rtc_get_counter_val();
         initbyStart = true;
       }
     }
     if (chargeMode) {
       opmode = MOD_PRECHARGE; // proceed to precharge if charge requested.
-      rlyDly = 25;            // Recharge sequence timer
+      rlyDly = PRECHARGE_RELAY_DELAY; // Delay before precharge relay closes
       vehicleStartTime = rtc_get_counter_val();
       initbyCharge = true;
     }
     if (preheater.GetRunPreHeat()) {
       opmode = MOD_PRECHARGE; // proceed to precharge if charge requested.
-      rlyDly = 25;            // Recharge sequence timer
+      rlyDly = PRECHARGE_RELAY_DELAY; // Delay before precharge relay closes
       vehicleStartTime = rtc_get_counter_val();
       preheater.SetInitByPreHeat(true);
     }
     if (maintainer12V.GetRunMaintainer()) {
       opmode = MOD_PRECHARGE; // proceed to precharge if charge requested.
-      rlyDly = 25;            // Recharge sequence timer
+      rlyDly = PRECHARGE_RELAY_DELAY; // Delay before precharge relay closes
       vehicleStartTime = rtc_get_counter_val();
       maintainer12V.SetInitByMaintainer(true);
     }
     Param::SetInt(Param::opmode, opmode);
     break;
 
-  case MOD_PRECHARGE:
+  case MOD_PRECHARGE: {
     if (!chargeMode) {
       if (selectedInverter != &openInv)
         DigIo::inv_out.Set(); // inverter power on but not if we are in charge
@@ -1014,14 +1013,13 @@ static void Ms10Task(void) {
       DigIo::inv_out.Set();
     }
     IOMatrix::GetPin(IOMatrix::NEGCONTACTOR)->Set();
-    if (rlyDly != 0)
-      rlyDly--; // here we are going to pause before energising precharge to
-                // prevent too many contactors pulling amps at the same time
+    // Qualify voltage only on ticks after the precharge relay is commanded on.
+    const bool prechargeSettling = rlyDly != 0;
+    if (prechargeSettling)
+      --rlyDly;
     if (rlyDly == 0)
       DigIo::prec_out.Set(); // commence precharge
-    if (prechargeMinTime != 0)
-      prechargeMinTime--; // 1 second minimum precharge time
-    if (!prechargeValid || !prechargeRequestActive) {
+    if (prechargeSettling || !prechargeValid || !prechargeRequestActive) {
       dcswDelay = DCSW_DELAY;
       dcswCommanded = false;
       hvactiveDelay = HVACTIVE_DELAY;
@@ -1035,7 +1033,7 @@ static void Ms10Task(void) {
       IOMatrix::GetPin(IOMatrix::COOLANTPUMP)->Clear();
 
       if (dcswDelay != 0)
-        dcswDelay--; // Keep precharge valid for 250 ms before setting DCSW.
+        dcswDelay--; // Keep precharge valid for 500 ms before setting DCSW.
 
       if (dcswDelay == 0) {
         DigIo::dcsw_out.Set();
@@ -1048,7 +1046,7 @@ static void Ms10Task(void) {
       IOMatrix::GetPin(IOMatrix::COOLANTPUMP)->Clear();
 
       if (hvactiveDelay != 0)
-        hvactiveDelay--; // DCSW must be on for 10 ms before HVACTIVE.
+        hvactiveDelay--; // DCSW must be on for 50 ms before HVACTIVE.
 
       if (hvactiveDelay == 0) {
         IOMatrix::GetPin(IOMatrix::HVACTIVE)->Set();
@@ -1093,8 +1091,9 @@ static void Ms10Task(void) {
         !maintainer12V.GetRunMaintainer())
       opmode = MOD_OFF;
 
-    if (udc < (Param::GetInt(Param::udcsw)) &&
-        rtc_get_counter_val() > (vehicleStartTime + PRECHARGE_TIMEOUT)) {
+    // Bound the whole sequence, including stalls with voltage above udcsw.
+    if (opmode == MOD_PRECHARGE &&
+        rtc_get_counter_val() - vehicleStartTime > PRECHARGE_TIMEOUT) {
       ClearPrechargeFailLoads();
       DigIo::dcsw_out.Clear();
       DigIo::prec_out.Clear();
@@ -1104,6 +1103,7 @@ static void Ms10Task(void) {
     }
     Param::SetInt(Param::opmode, opmode);
     break;
+  }
 
   case MOD_PCHFAIL: {
     StartSig = false;
